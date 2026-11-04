@@ -28,3 +28,4 @@ report*.txt
 *.docx
 题库合并.json
 /shots/
+glasses/shots/qbank-full.json
