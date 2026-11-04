@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">题眼</string>
+    <string name="permission_camera_rationale">需要相机权限，用于拍题识别。</string>
+    <string name="permission_denied_camera">未授予相机权限，无法拍题。</string>
+    <string name="permission_record_audio_rationale">需要麦克风权限以录制原始多通道音频。</string>
+    <string name="permission_denied_record_audio">未授予麦克风权限，无法录音。</string>
+</resources>

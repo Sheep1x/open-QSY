@@ -60,6 +60,11 @@ class HotkeyManager(QObject):
         self._hotkeys.append((combo, mod_vks, main_vk, callback))
         logger.info("Registered hotkey: %s", combo)
 
+    def clear(self):
+        """Remove all registered hotkeys (used when rebinding)."""
+        self._hotkeys.clear()
+        self._pressed.clear()
+
     def start(self):
         self._timer.start(80)  # poll every 80ms
 

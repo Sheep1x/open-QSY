@@ -19,3 +19,12 @@ crash_log.txt
 resources/icon_old.jpg
 Output/
 .claude/
+
+# local temp artifacts and binary assets (not tracked)
+_*.py
+_*.txt
+report*.txt
+*.exe
+*.docx
+题库合并.json
+/shots/

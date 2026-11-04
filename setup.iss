@@ -1,5 +1,5 @@
 #define MyAppName "题眼"
-#define MyAppVersion "1.0-20260514"
+#define MyAppVersion "1.6-20260923"
 #define MyAppPublisher "孙启然、杨一旭"
 #define MyAppExeName "Open-QSY.exe"
 

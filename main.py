@@ -8,10 +8,20 @@ import traceback
 
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
+from core.config import get_config_dir
+
+_log_dir = str(get_config_dir())
+os.makedirs(_log_dir, exist_ok=True)
+_log_file = os.path.join(_log_dir, "app.log")
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     datefmt="%H:%M:%S",
+    handlers=[
+        logging.FileHandler(_log_file, encoding="utf-8", mode="w"),
+        logging.StreamHandler(sys.stdout),
+    ],
 )
 
 MUTEX_NAME = "Global\\Open-QSY-SingleInstance"
@@ -63,6 +73,8 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("题眼")
+    # Tray-resident app: hiding the main window must not quit the process
+    app.setQuitOnLastWindowClosed(False)
 
     try:
         from ui.main_window import MainWindow

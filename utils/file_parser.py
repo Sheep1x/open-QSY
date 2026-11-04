@@ -50,6 +50,7 @@ def parse_docx(filepath: str) -> list[dict]:
     doc = Document(filepath)
     items = []
     current_question = None
+    current_options = {}
 
     for p in doc.paragraphs:
         text = p.text.strip().replace('\xa0', ' ')
@@ -63,9 +64,23 @@ def parse_docx(filepath: str) -> list[dict]:
         # Question line
         m = re.match(r'^\d+、\[(组合题)?([单多]选题)\]', text)
         if m:
+            # Finalize previous question's options
+            if current_question and current_options:
+                current_question["options"] = current_options
+                parts = [current_question["question"]]
+                for key in sorted(current_options.keys()):
+                    parts.append(f"{key} {current_options[key]}")
+                current_question["question_full"] = " ".join(parts)
             q_text = text[m.end():].strip()
             current_question = {"question": q_text, "answer": ""}
+            current_options = {}
             items.append(current_question)
+            continue
+
+        # Option line: A、xxx
+        m = re.match(r'^([A-E])[、.〕）)]\s*(.+)', text)
+        if m and current_question is not None:
+            current_options[m.group(1)] = m.group(2).strip()
             continue
 
         # Answer line
@@ -74,11 +89,17 @@ def parse_docx(filepath: str) -> list[dict]:
             current_question["answer"] = m.group(1).strip()
             continue
 
-        # Skip 难度 lines and option lines — not stored in quiz bank
+        # Skip 难度 lines
         if re.match(r'^难度[：:]', text):
             continue
-        if re.match(r'^[A-E]、', text):
-            continue
+
+    # Finalize last question's options
+    if current_question and current_options:
+        current_question["options"] = current_options
+        parts = [current_question["question"]]
+        for key in sorted(current_options.keys()):
+            parts.append(f"{key} {current_options[key]}")
+        current_question["question_full"] = " ".join(parts)
 
     logger.info("Parsed %d items from %s (docx)", len(items), filepath)
     return items
@@ -168,6 +189,11 @@ def parse_file(filepath: str, question_col: str = "", answer_col: str = "") -> l
                     options[key] = val
         if options:
             item["options"] = options
+        # Auto-generate question_full (stem + options) for dual-column search
+        parts = [q]
+        for key in sorted(options.keys()):
+            parts.append(f"{key} {options[key]}")
+        item["question_full"] = " ".join(parts)
         items.append(item)
 
     logger.info("Parsed %d items from %s (header=%s, q=%s, a=%s, opts=%s)", len(items), filepath, has_header, q_col, a_col, list(option_cols.keys()))

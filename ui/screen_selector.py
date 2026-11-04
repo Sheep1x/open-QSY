@@ -2,12 +2,19 @@ import logging
 
 import cv2
 import numpy as np
-from PIL import ImageGrab
 from PyQt6.QtCore import Qt, QRect, QPoint, pyqtSignal, QThread
 from PyQt6.QtGui import QPainter, QPen, QColor, QCursor
 from PyQt6.QtWidgets import QWidget, QApplication, QSizeGrip
 
+try:
+    import mss  # fast screen capture (~3-5x faster than PIL ImageGrab)
+    _HAS_MSS = True
+except ImportError:
+    from PIL import ImageGrab
+    _HAS_MSS = False
+
 from core.camera import detect_change
+from ui.overlay import is_transparent_color
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +27,7 @@ class ScreenSelector(QWidget):
     """
     area_confirmed = pyqtSignal(object)  # emits QRect
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, border_color: str = "#00ff88"):
         super().__init__(parent)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -34,14 +41,22 @@ class ScreenSelector(QWidget):
         self._screen_geo = screen
         self.setGeometry(screen)
 
+        self._border_color = border_color
         self._drawing = False
         self._start: QPoint | None = None
         self._end: QPoint | None = None
         self._confirmed = False
         self.setCursor(Qt.CursorShape.CrossCursor)
 
+    def set_border_color(self, color: str):
+        self._border_color = color
+        self.update()
+
     def paintEvent(self, event):
         painter = QPainter(self)
+        border = None
+        if not is_transparent_color(self._border_color):
+            border = QColor(self._border_color)
         if not self._confirmed:
             # drawing phase: light overlay
             painter.fillRect(self.rect(), QColor(0, 0, 0, 80))
@@ -50,16 +65,15 @@ class ScreenSelector(QWidget):
                 painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
                 painter.fillRect(rect, Qt.GlobalColor.transparent)
                 painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-                pen = QPen(QColor("#00ff88"), 3)
-                painter.setPen(pen)
-                painter.drawRect(rect)
+                if border:
+                    painter.setPen(QPen(border, 3))
+                    painter.drawRect(rect)
                 painter.setPen(QColor("#ffffff"))
                 painter.drawText(rect.topLeft() + QPoint(5, -8),
                                  f"{rect.width()} x {rect.height()}  —  释放确认")
-        else:
-            # confirmed phase: border only
-            pen = QPen(QColor("#00ff88"), 2, Qt.PenStyle.DashLine)
-            painter.setPen(pen)
+        elif border:
+            # confirmed phase: border only (invisible when transparent)
+            painter.setPen(QPen(border, 2, Qt.PenStyle.DashLine))
             painter.drawRect(self.rect().adjusted(1, 1, -1, -1))
 
     def mousePressEvent(self, event):
@@ -153,8 +167,17 @@ class ScreenCaptureThread(QThread):
         if self._rect is None:
             return None
         try:
-            x1, y1 = self._rect.x(), self._rect.y()
-            x2, y2 = x1 + self._rect.width(), y1 + self._rect.height()
+            dpr = QApplication.primaryScreen().devicePixelRatio()
+            x1 = int(self._rect.x() * dpr)
+            y1 = int(self._rect.y() * dpr)
+            x2 = int((self._rect.x() + self._rect.width()) * dpr)
+            y2 = int((self._rect.y() + self._rect.height()) * dpr)
+            if _HAS_MSS:
+                with mss.mss() as sct:
+                    monitor = {"left": x1, "top": y1, "width": x2 - x1, "height": y2 - y1}
+                    shot = sct.grab(monitor)
+                    # BGRA → BGR, contiguous for downstream cv2 operations
+                    return np.ascontiguousarray(np.asarray(shot)[:, :, :3])
             img = ImageGrab.grab(bbox=(x1, y1, x2, y2))
             return np.array(img)[:, :, ::-1].copy()  # RGB→BGR
         except Exception as e:

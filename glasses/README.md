@@ -1,0 +1,141 @@
+# 题眼 · 眼镜端（GlassEyes）
+
+Rokid Glasses **裸机（bare-metal）** 单机应用：不连手机、不联网，眼镜上直接
+**定时拍照识题 → 离线 OCR → 本地题库匹配 → 屏上显示答案**（每 3 秒自动拍一张，无需按键）。
+
+- 运行环境：YodaOS-Sprite（Android 12 / API 31，Android Go），480×640 单绿显示
+- 工程来源：基于 Rokid 官方 `GlassesBareDevSample`（含其 480×640 线框 UI 体系与按键分发），
+  已改包名 `com.openqsy.glasses` 并裁掉音频/录像/IMU 示例，只保留拍题链路
+- 题库：由 PC 端 `tools/build_qbank.py` 把 `题库合并.json` 编译成 `app/src/main/assets/qbank.idx`
+  （6622 题 → **0.91 MB**，查询 1~3 ms，PC 侧实测 top1 98%）
+
+## 目录
+
+```
+glasses/
+├── GlassEyes/                     # Android 工程（Android Studio 直接 Open 这个目录）
+│   ├── app/src/main/assets/qbank.idx      # 编译产物，随 APK 打包
+│   └── app/src/main/java/com/openqsy/glasses/
+│       ├── activities/main/MainActivity.kt   # 单 Activity + 按键分发
+│       ├── ui/screen/QuizScreen.kt           # 一拍一答的眼镜界面
+│       ├── quiz/QBankStore.kt                # 索引读取 + 检索（无第三方依赖）
+│       ├── quiz/TextNormalizer.kt            # 归一化，必须与 Python 端逐条一致
+│       ├── ocr/OcrEngine.kt                  # OCR 抽象（换引擎只改这一层）
+│       ├── ocr/MlKitOcrEngine.kt             # ML Kit 中文离线识别（默认）
+│       ├── solve/SolveViewModel.kt           # 状态机：拍摄→识别→匹配→出答案
+│       ├── input/                            # 官方按键分发（TouchPad / 镜腿）
+│       └── ui/design/                        # 官方 480×640 线框 UI 体系
+└── tools/
+    ├── build_qbank.py             # 题库编译 + 内置噪声自检（--self-test）
+    ├── serve_bank.py              # 把题库发布成局域网地址并生成二维码（换题库用）
+    ├── dump_idx.py                # 抽查 qbank.idx：题数/词条/题干/答案是否齐全
+    └── layout_preview.py          # PC 上模拟 480×640 排版，检查重叠/越界
+```
+
+## 构建与装机
+
+```bash
+# 0. 前置：Rokid AI App 里打开眼镜 ADB；必须用「数据调试线」（充电线不行）
+adb devices                      # 应看到 Rokid RG-glasses 一类设备
+
+# 1. 换题库（可选）：改了题库 JSON 后重新编译索引
+python tools/build_qbank.py --input ../../题库合并.json \
+       --output GlassEyes/app/src/main/assets/qbank.idx --self-test
+
+# 2. 构建
+cd GlassEyes
+./gradlew :app:assembleDebug
+
+# 3. 安装并启动
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n com.openqsy.glasses/.activities.main.MainActivity
+
+# 4. 看日志 / 投屏
+adb logcat -v time --pid "$(adb shell pidof -s com.openqsy.glasses)"
+scrcpy --window-title 题眼          # 480×640 同屏，便于确认 UI
+```
+
+**换题库（零门槛，会扫二维码就行）**：电脑（或任何能放文件的地方）把题库变成一个网址，
+把网址做成二维码，眼镜扫一下 → 下载 → 现场编译 → **几秒内自动生效，不用重启、不用重装**。
+
+- 电脑上一行命令就够：`python glasses/tools/serve_bank.py 题库合并.json`
+  （脚本会起局域网服务、打印地址、弹出二维码）；
+- 不在同一网络也行：`--url https://…/qbank.json`，任何文件直链都能扫；
+- 支持 `.json`（可直接传 PC 端那个 `题库合并.json`，眼镜自己编译）和 `.idx`；
+- 设备端编译结果与 PC 端 `build_qbank.py` **逐字节相同**（md5 `210aeb0b…`，1.9 MB / 6622 题约 1.7 秒）；
+- 扫到的文件落在应用私有目录并持久，下次启动仍然生效；
+- 也能「放进设备就生效」：`adb push 题库合并.json /sdcard/Download/` 后重启应用，
+  `QBankLoader.discover()` 会按修改时间挑最新的一个（需授予存储权限）；
+- 详见 `docs/04-换题库指南.md`。
+
+## 交互
+
+| 动作 | 硬件事件 | 行为 |
+|---|---|---|
+| 单击 | TouchPad 单指单击 `KEYCODE_ENTER` / 镜腿单击广播 | 暂停 / 继续定时拍照 |
+| **双击**（等同系统返回） | TouchPad 单指双击 `KEYCODE_BACK` | **返回**：关调试 → 清空结果 → 解除暂停 → **退出应用** |
+| 单指前滑 / 后滑 | `DPAD_RIGHT→DPAD_DOWN` / `DPAD_LEFT→DPAD_UP` 键序列 | 切换 top-3 候选 |
+| 长按 | TouchPad 长按 `KEYCODE_PROG_BLUE` + `ACTION_AI_START` | 调试页（索引规模 / OCR 与匹配耗时 / 频次 / 候选分数 / OCR 原文 / 当前题库 / 上传地址） |
+
+调试页内：**单击** → 扫码换题库页，**双击 / 长按** → 回主界面。
+扫码页内按任意键返回（`Done` / `Failed` 时单击可重新扫）。
+
+## 开发验收口子
+
+眼镜上没有 adb 能模拟的触摸/长按，`screencap` 在熄屏时还会返回全黑，所以留了几个
+`am start` 参数直接用 intent 把界面摆到目标状态，再截图核对：
+
+```bash
+PKG=com.openqsy.glasses/.activities.main.MainActivity
+adb shell input keyevent KEYCODE_WAKEUP                    # 不唤醒的话截图全黑
+adb shell am start -n $PKG --es open debug                 # 调试页
+adb shell am start -n $PKG --es open scan                  # 扫码换题库页
+adb shell am start -n $PKG --es demo short|long|calc|ocr      # 灌一条假命中，验收答案区排版
+adb shell am start -n $PKG --es url  http://…/qbank.json   # 跳过扫码，直测下载+编译
+adb shell am start -n $PKG --es qrimg /data/local/tmp/qr.png  # 跳过相机，直接解一张二维码图
+adb shell am start -n $PKG --es ocrimg /data/local/tmp/q3.png # 跳过相机，对一张图跑裁剪+识别+检索，只打日志
+adb shell am start -n $PKG --es crop 0                        # 关掉「按取景框裁剪」，退回整帧识别，用于对比诊断
+```
+
+`tools/layout_preview.py` 可以在 PC 上把 480×640 的排布算一遍并渲染 PNG，做重叠/越界检查，
+改字号或行高后先跑它，再上机截图。
+
+
+## 已知边界
+
+- 单绿屏：黑 = 不发光，UI 只能用绿色线条 + 文字，不能显示彩色题图；
+- **定时拍照**：`ImageAnalysis` 持续取帧（`KEEP_ONLY_LATEST`），但每 **3 秒**才真正拍一张送 OCR，
+  中间到的帧全部丢弃（`SHOT_INTERVAL_MS`）——屏幕上是「拍一张 → 出结果 → 定格 → 再拍」，
+  而不是答案每几百毫秒抖一次；
+- **取景框 = 识别范围**：还没认出题时，面板顶部显示 140dp 高的相机实时画面（`Preview` + `PreviewView`，
+  COMPATIBLE/TextureView 模式）。相机帧是竖构图，FILL_CENTER 下露出来的只是**整帧纵向中间约 1/4**，
+  所以识别前会先把帧裁成同一块（`MlKitOcrEngine.cropToViewfinder`）——「屏幕上看到的」和「实际识别的」
+  必须是同一块画面，否则框外的相邻题目会被一起认进来，答案就落到别的题上去了。
+  一旦出答案就把取景框收起来，把高度还给答案区（否则 16sp 的选项原文要少 6 行）；
+  取景框边框每拍一张闪一下，标题栏同时写着「已拍 N 张」——画面本身几乎不动，没有这两个信号用户会以为根本没在拍；
+- **中心聚焦**：裁剪后画面里常常还有两三道题。拿整段文字去检索，命中的往往是文字最密的那道，
+  不一定是用户框住的那道。所以匹配时从**最靠近画面中心的一行**出发向上下交替扩展，取 2~6 行
+  分别检索，挑分数最高的窗口（`SolveViewModel.searchAroundCenter`）——这就是「答案对到了别的题」的解法。
+  实测同一张图：取中心 2 行得 0.977，取整段只有 0.816；
+- **不存照片**：相机帧只在内存里走一遍（`ImageProxy` → ML Kit → 文字），不转 Bitmap、不写文件、不上传，出口只有 `image.close()`；清单里刻意不申请 `WRITE_EXTERNAL_STORAGE` / `MANAGE_EXTERNAL_STORAGE` / 录音 / 录像权限——没有权限，就算哪天代码写错也落不了盘。实测：连续识别 45 秒（17 张），公共目录与私有目录文件数一字节不差；
+- 同一题连续命中 2 次才标记「已确认」，避免答案随噪声乱跳；
+- 答案里直接拼选项原文（`C. 中国共产党的…`，多选一行一个），不再只给字母；
+- 长答案（简答/计算/案例解答）降为 16sp、最多 10 行，超出截断——一屏装不下几百字，
+  这类题的完整解答请回到原题库查看；
+- OCR 和取景预览是两个热源：OCR 已固定在 3 秒一次；预览是相机持续推流，已用
+  `Preview.Builder().setTargetFrameRate(Range(10, 15))` 把出流压到 10~15 fps
+  （同一颗 sensor 只有一档帧率，分析流会跟着降下来），功耗约减半。
+  `ImageAnalysis.Builder` **没有** `setTargetFrameRate`，写到那边会编译不过；
+  再长时间使用仍建议单击暂停——暂停后连相机都解绑（不只是不识别），镜腿会明显凉下来，
+  代价是恢复时要重新绑定、画面黑一两秒；
+- ML Kit bundled 模型使 APK 增加约 25~35 MB；若目标固件缺少其 native 依赖，
+  按 `docs/02-技术方案.md` 换 PP-OCR(ONNX Runtime) 实现，`OcrEngine` 接口不变。
+
+## 文档
+
+- `docs/01-官方裸机开发要点.md` —— 官方文档（custom.rokid.com 裸机开发专栏）要点与踩坑清单
+- `docs/02-技术方案.md` —— 架构、OCR 选型对比、匹配算法、性能与功耗预算、里程碑
+- `docs/03-题库索引格式.md` —— `qbank.idx` 二进制格式规范与实测数据
+- `docs/04-换题库指南.md` —— **给不懂编程的使用者**：怎么把题库做成二维码让眼镜扫
+
+> 仅用于个人学习与技术研究，请遵守考试与平台规则。
