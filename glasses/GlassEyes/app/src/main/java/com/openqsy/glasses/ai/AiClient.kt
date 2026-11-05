@@ -20,17 +20,28 @@ object AiClient {
     private const val CHAT_TIMEOUT_MS = 45_000
     private const val MAX_RESPONSE_BYTES = 512 * 1024
 
+    /** 答案最多留几行——屏上答案区就七八行。 */
+    private const val MAX_ANSWER_LINES = 8
+
     /** 带着用户能看懂的原因抛出去，界面直接展示 message。 */
     class AiException(message: String) : Exception(message)
 
     private val SYSTEM_PROMPT = """
-        你是考试答题助手。用户会用摄像头拍下一道题的原文（可能有错字、漏字、换行错乱）。
-        请只依据题目本身作答：
-        1. 第一行就给答案：选择题给出所选字母和该选项的内容（多选按字母顺序一行一个）；
-        2. 然后用一到两句话说明理由。
-        不要复述题目，不要寒暄，不要编造题干里没有的条件，不要展开推导步骤。
-        全文不超过 6 行——答案要显示在一块很小的屏幕上。
-        如果题目残缺到无法判断，只回一句「题目信息不足」，不要猜。
+        你是考试答题助手。用户用摄像头拍了一道题，OCR 出来的文字可能有错字、漏字、串行。
+
+        输出格式（严格遵守，第 6 行之后的内容会被程序直接丢弃）：
+        第 1 行：只写答案。选择题写「字母. 选项内容」，多选按字母顺序一行一个。
+        第 2~5 行：说明理由，最多两句话。
+
+        正确输出示例（照这个样子写）：
+        B. 第二产业
+        建筑业是物质生产部门，直接从事建筑安装工程，因此属于第二产业。
+
+        铁律：
+        - 不要复述题目，不要逐个列举选项，不要描述你是如何还原文字的，不要展开推导步骤。
+        - 不要在末尾再重复一遍答案。
+        - 如果题目信息不足（缺图、缺数据、错漏太多以至于选不出答案），
+          只输出一行「题目信息不足」，不要再解释原因。
     """.trimIndent()
 
     /** `GET {baseUrl}/models`，返回模型 id 列表。 */
@@ -111,7 +122,17 @@ object AiClient {
             "chat ok: ${root.optString("model")} " +
                 "finish=${choices.optJSONObject(0)?.optString("finish_reason")} chars=${content.length}",
         )
-        return content
+        return limitLines(content, MAX_ANSWER_LINES)
+    }
+
+    /**
+     * 兜一道保险：prompt 里已经要求最多 5 行，但模型经常不当回事（实测 deepseek 会写到 12 行）。
+     * 屏幕上答案区一共就七八行，多的留着也只是被裁掉，不如在这里截断并标记。
+     */
+    private fun limitLines(text: String, max: Int): String {
+        val lines = text.lines()
+        if (lines.size <= max) return text
+        return lines.take(max).joinToString("\n") + "…"
     }
 
     /**

@@ -133,7 +133,10 @@ fun QuizScreen(
                 ResolutionSelector.Builder()
                     .setResolutionStrategy(
                         ResolutionStrategy(
-                            Size(1024, 768),
+                            // 取景框只占整帧纵向中间一段，裁剪之后真正送进 OCR 的像素并不多：
+                            // 1024×768 时只剩 768×244，竖排小字（文言文、公式）糊成一团。
+                            // 提到 1440×1080 后裁出来是 1080×343，字高约 1.4 倍，ML Kit 多花几十毫秒。
+                            Size(1440, 1080),
                             ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
                         )
                     )
