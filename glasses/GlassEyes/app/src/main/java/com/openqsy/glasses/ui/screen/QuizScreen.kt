@@ -5,6 +5,7 @@ import android.util.Range
 import android.util.Size
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
+import androidx.camera.core.UseCase
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.view.PreviewView
@@ -121,27 +122,40 @@ fun QuizScreen(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
 
+    // 默认不绑 Preview，只画辅助框。实测（同一台机器、各跑 60 秒）：
+    //   绑 Preview + ImageAnalysis → 单核占用 84%，60 秒升温 7.2 ℃
+    //   只绑 ImageAnalysis       → 单核占用 35%
+    // 差的那一半是 TextureView 每帧合成 + 第二路出流。要看实时画面时加 --es preview 1。
+    val noPreview = remember {
+        activity?.intent?.getStringExtra("preview") != "1"
+    }
+
     // 单线程：OCR 与匹配都在这一条线上串行执行，避免并发抢 CPU（Go 设备只有小核）
     val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
+
+    // 预览与分析必须同一分辨率：取景框是 FILL_CENTER，露出多少取决于画面宽高比。
+    // 两边比例一旦不同，框里看到的和送进 OCR 的就不是同一块——实测过这个坑（框里是题 A，
+    // 答案给的是画面正中的题 B）。
+    val resolutionSelector = remember {
+        ResolutionSelector.Builder()
+            .setResolutionStrategy(
+                ResolutionStrategy(
+                    // 取景框只占整帧纵向中间一段，裁剪之后真正送进 OCR 的像素并不多：
+                    // 1024×768 时只剩 768×244，竖排小字（文言文、公式）糊成一团。
+                    // 提到 1440×1080 后裁出来是 1080×343，字高约 1.4 倍，ML Kit 多花几十毫秒。
+                    Size(1440, 1080),
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                )
+            )
+            .build()
+    }
 
     val analysis = remember {
         ImageAnalysis.Builder()
             // 关键：只保留最新帧，旧帧直接丢，避免"识别跟不上导致画面越积越慢"
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-            .setResolutionSelector(
-                ResolutionSelector.Builder()
-                    .setResolutionStrategy(
-                        ResolutionStrategy(
-                            // 取景框只占整帧纵向中间一段，裁剪之后真正送进 OCR 的像素并不多：
-                            // 1024×768 时只剩 768×244，竖排小字（文言文、公式）糊成一团。
-                            // 提到 1440×1080 后裁出来是 1080×343，字高约 1.4 倍，ML Kit 多花几十毫秒。
-                            Size(1440, 1080),
-                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
-                        )
-                    )
-                    .build()
-            )
+            .setResolutionSelector(resolutionSelector)
             .build()
     }
 
@@ -157,6 +171,7 @@ fun QuizScreen(
     val preview = remember {
         Preview.Builder()
             .setTargetFrameRate(Range(10, 15))
+            .setResolutionSelector(resolutionSelector)
             .build()
             .apply { setSurfaceProvider(previewView.surfaceProvider) }
     }
@@ -256,7 +271,7 @@ fun QuizScreen(
         enabled = cameraGranted && !pausedNow,
         onReady = { viewModel.onCameraReady() },
         onError = { viewModel.onCameraError(it) },
-        useCases = { arrayOf(preview, analysis) },
+        useCases = { if (noPreview) arrayOf<UseCase>(analysis) else arrayOf(preview, analysis) },
     )
 
     RegisterBareKeyHandler { event ->
@@ -349,6 +364,7 @@ fun QuizScreen(
                         view = previewView,
                         height = if (idle) BareTokens.ViewfinderH else BareTokens.ViewfinderCompactH,
                         flash = flash,
+                        showPreview = !noPreview,
                         onSize = { w, h ->
                             // 只认「还没出答案」时的高度来算裁剪比例：出答案后高度变成
                             // 100dp，按它算会把识别区裁得更窄，反而认不出，来回抖。
@@ -424,6 +440,7 @@ internal fun CameraViewfinder(
     height: Dp = BareTokens.ViewfinderH,
     fit: Boolean = false,
     flash: Boolean = false,
+    showPreview: Boolean = true,
     onSize: ((Int, Int) -> Unit)? = null,
 ) {
     // 换题库页要看到整个二维码，主界面只要看到"中间那几行字"，两者的取景方式不同
@@ -444,10 +461,36 @@ internal fun CameraViewfinder(
                 color = NeonGreen.copy(alpha = if (flash) 1f else 0.5f),
             ),
     ) {
-        AndroidView(
-            factory = { view },
-            modifier = Modifier.fillMaxSize(),
-        )
+        if (showPreview) {
+            AndroidView(
+                factory = { view },
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else {
+            // 不显示画面时，用十字标出"这一条会被识别"：框本身即识别范围，
+            // 横线示意画面中心，左右两道竖线示意裁到哪。
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val cy = size.height / 2f
+                drawLine(
+                    color = NeonGreen.copy(alpha = 0.30f),
+                    start = Offset(0f, cy),
+                    end = Offset(size.width, cy),
+                    strokeWidth = 1f,
+                )
+                drawLine(
+                    color = NeonGreen.copy(alpha = 0.35f),
+                    start = Offset(2f, 0f),
+                    end = Offset(2f, size.height),
+                    strokeWidth = 5f,
+                )
+                drawLine(
+                    color = NeonGreen.copy(alpha = 0.35f),
+                    start = Offset(size.width - 2f, 0f),
+                    end = Offset(size.width - 2f, size.height),
+                    strokeWidth = 5f,
+                )
+            }
+        }
     }
 }
 

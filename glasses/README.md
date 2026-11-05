@@ -113,6 +113,7 @@ adb shell am start -n $PKG --es url  http://…/qbank.json   # 跳过扫码，�
 adb shell am start -n $PKG --es qrimg /data/local/tmp/qr.png  # 跳过相机，直接解一张二维码图
 adb shell am start -n $PKG --es ocrimg /data/local/tmp/q3.png # 跳过相机，对一张图跑裁剪+识别+检索，只打日志
 adb shell am start -n $PKG --es crop 0                        # 关掉「按取景框裁剪」，退回整帧识别，用于对比诊断
+adb shell am start -n $PKG --es preview 1                     # 打开实时画面（默认只画辅助框，省电）
 ```
 
 `tools/layout_preview.py` 可以在 PC 上把 480×640 的排布算一遍并渲染 PNG，做重叠/越界检查，
@@ -193,15 +194,18 @@ adb forward tcp:18080 tcp:8080
 - **定时拍照**：`ImageAnalysis` 持续取帧（`KEEP_ONLY_LATEST`），但每 **3 秒**才真正拍一张送 OCR，
   中间到的帧全部丢弃（`SHOT_INTERVAL_MS`）——屏幕上是「拍一张 → 出结果 → 定格 → 再拍」，
   而不是答案每几百毫秒抖一次；
-- **取景框 = 识别范围**：还没认出题时，面板顶部显示 140dp 高的相机实时画面（`Preview` + `PreviewView`，
-  COMPATIBLE/TextureView 模式）。相机帧是竖构图，FILL_CENTER 下露出来的只是**整帧纵向中间约 1/4**，
-  所以识别前会先把帧裁成同一块（`MlKitOcrEngine.cropToViewfinder`）——「屏幕上看到的」和「实际识别的」
-  必须是同一块画面，否则框外的相邻题目会被一起认进来，答案就落到别的题上去了。
-  一旦出答案**不把取景框收起**，只从 140dp 压到 84dp（`ViewfinderCompactH`）：用户还得看得见相机
-  对着哪一段，才能确认答案是这道题的；而把整块移出组合会让 `PreviewView` detach，CameraX 去重配
-  surface 会撞 5000ms 超时、界面直接卡住（踩过，日志是 `Unable to configure camera` +
+- **取景框 = 识别范围**：面板顶部那块框就是每次送去 OCR 的范围。默认**不绑 `Preview`**，只画
+  辅助框（中心横线 + 两侧竖线），因为实时画面太费电——同一台机器各跑 60 秒：
+  绑 `Preview` 时单核占用 **60.6%**、温度 45.6→50.4 ℃；只绑 `ImageAnalysis` 时 **25.3%**、
+  42.8→43.2 ℃。差的那一半是 TextureView 每帧合成 + 相机第二路出流。
+  要看实时画面时加 `--es preview 1`（那种模式下 FILL_CENTER 露出的是整帧纵向中间约 1/4，
+  识别前会把帧裁成同一块；`Preview` 与 `ImageAnalysis` 共用同一个 `ResolutionSelector`，
+  比例不一致会让「框里看到的」和「实际识别的」错位，踩过）。
+  一旦出答案**不收起框**，只从 140dp 压到 84dp（`ViewfinderCompactH`）：用户还得看得出相机
+  对着哪一段，才能确认答案是这道题的；预览模式下把整块移出组合会让 `PreviewView` detach，
+  CameraX 去重配 surface 会撞 5000ms 超时、界面直接卡住（踩过，日志是 `Unable to configure camera` +
   `TimeoutException ... 5000 ms` + `Resetting Capture Session`）；
-  取景框边框每拍一张闪一下，标题栏同时写着「已拍 N 张」——画面本身几乎不动，没有这两个信号用户会以为根本没在拍；
+  框边每拍一张闪一下，标题栏同时写着「已拍 N 张」——画面本身几乎不动，没有这两个信号用户会以为根本没在拍；
 - **中心聚焦**：裁剪后画面里常常还有两三道题。拿整段文字去检索，命中的往往是文字最密的那道，
   不一定是用户框住的那道。所以匹配时从**最靠近画面中心的一行**出发向上下交替扩展，取 2~6 行
   分别检索，挑分数最高的窗口（`SolveViewModel.searchAroundCenter`）——这就是「答案对到了别的题」的解法。
