@@ -70,6 +70,7 @@ fun rememberCameraBound(
             cancelled = true
             ready = false
             provider?.unbindAll()
+            Log.d(TAG, "Camera unbound (enabled=$enabled)")
             onUnbind()
         }
     }

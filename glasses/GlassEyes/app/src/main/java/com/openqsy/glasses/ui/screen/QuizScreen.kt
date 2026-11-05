@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Text
+import android.util.Log
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -74,6 +75,9 @@ fun QuizScreen(
     onExit: () -> Unit,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    LaunchedEffect(state) {
+        Log.d("BareQuiz", "state → ${state::class.simpleName} hit=${(state as? QuizUiState.Live)?.hit?.docId}")
+    }
     val debug by viewModel.debug.collectAsStateWithLifecycle()
     val scan by viewModel.scan.collectAsStateWithLifecycle()
     val shotSeq by viewModel.shot.collectAsStateWithLifecycle()
@@ -184,9 +188,63 @@ fun QuizScreen(
         if (debugQrImg.isNotBlank()) viewModel.scanFromImage(debugQrImg)
     }
 
+    // 验收排版用：`am start ... --es demo short|long|calc|ocr` 直接灌一条假命中。
+    // 眼镜上没法远程制造真实的识别结果，改答案区排版时只能这样把不同长度的答案渲染出来截图核对。
+    // 定义在相机绑定之前：相机会话要跟着「有没有答案」走，验收口子得走同一条路。
+    val demoState = remember {
+        // `--es demo ocr`：造「认出了字但题库里没有」的状态，用来核对取景框占位后
+        // 剩下那 103px 能不能装下「对准题目 + 一行提示 + 2 行 OCR 原文」。
+        if (activity?.intent?.getStringExtra("demo") == "ocr") {
+            return@remember QuizUiState.Live(
+                hit = null,
+                locked = false,
+                candidateIndex = 0,
+                candidateCount = 0,
+                ocrMs = 420,
+                matchMs = 6,
+                scansPerMin = 12,
+                paused = false,
+                hint = "题库里没找到 · 识别 96 字",
+                ocrPreview = DEMO_OCR_PREVIEW,
+            )
+        }
+        val answer = when (activity?.intent?.getStringExtra("demo")) {
+            "short" -> "C. 中国共产党第十三次全国代表大会"
+            "long" -> DEMO_LONG_ANSWER
+            "calc" -> DEMO_CALC_ANSWER
+            else -> null
+        }
+        answer?.let {
+            QuizUiState.Live(
+                hit = QuizHit(docId = 0, score = 0.87f, stem = DEMO_STEM, answer = it,
+                    subject = "房地产制度法规政策"),
+                locked = true,
+                candidateIndex = 0,
+                candidateCount = 1,
+                ocrMs = 6,
+                matchMs = 1,
+                scansPerMin = 12,
+                paused = false,
+                hint = "",
+            )
+        }
+    }
+    val shownDemo = demoState ?: state
+
     // 暂停 = 真的停：连相机都不绑定。否则"暂停"只是不送 OCR，预览照样持续推流，
     // 镜腿该热还是热。代价是恢复时要重新绑定，画面会黑一两秒。
-    val pausedNow = (state as? QuizUiState.Live)?.paused == true
+    val pausedNow = (shownDemo as? QuizUiState.Live)?.paused == true
+    // 相机会话只管"授权 + 有没有暂停"，不跟着"有没有答案"走：
+    // 用户要的是"拍一张 → 出答案 → 过几秒再拍再识别"，一旦出答案就解绑，
+    // 后面那几张就拍不成了。出答案时的卡顿改由取景框那边解决（压到 1dp，不 detach）。
+    val hasHit = (shownDemo as? QuizUiState.Live)?.hit != null
+    LaunchedEffect(cameraGranted, pausedNow, hasHit) {
+        Log.d(
+            "BareQuiz",
+            "bind state: granted=$cameraGranted paused=$pausedNow hasHit=$hasHit " +
+                "→ enabled=${cameraGranted && !pausedNow}",
+        )
+    }
     rememberCameraBound(
         context = context,
         lifecycleOwner = lifecycleOwner,
@@ -249,47 +307,7 @@ fun QuizScreen(
         return
     }
 
-    // 验收排版用：`am start ... --es demo short|long|calc|ocr` 直接灌一条假命中。
-    // 眼镜上没法远程制造真实的识别结果，改答案区排版时只能这样把不同长度的答案渲染出来截图核对。
-    val demoState = remember {
-        // `--es demo ocr`：造「认出了字但题库里没有」的状态，用来核对取景框占位后
-        // 剩下那 103px 能不能装下「对准题目 + 一行提示 + 2 行 OCR 原文」。
-        if (activity?.intent?.getStringExtra("demo") == "ocr") {
-            return@remember QuizUiState.Live(
-                hit = null,
-                locked = false,
-                candidateIndex = 0,
-                candidateCount = 0,
-                ocrMs = 420,
-                matchMs = 6,
-                scansPerMin = 12,
-                paused = false,
-                hint = "题库里没找到 · 识别 96 字",
-                ocrPreview = DEMO_OCR_PREVIEW,
-            )
-        }
-        val answer = when (activity?.intent?.getStringExtra("demo")) {
-            "short" -> "C. 中国共产党第十三次全国代表大会"
-            "long" -> DEMO_LONG_ANSWER
-            "calc" -> DEMO_CALC_ANSWER
-            else -> null
-        }
-        answer?.let {
-            QuizUiState.Live(
-                hit = QuizHit(docId = 0, score = 0.87f, stem = DEMO_STEM, answer = it,
-                    subject = "房地产制度法规政策"),
-                locked = true,
-                candidateIndex = 0,
-                candidateCount = 1,
-                ocrMs = 6,
-                matchMs = 1,
-                scansPerMin = 12,
-                paused = false,
-                hint = "",
-            )
-        }
-    }
-    val shown = demoState ?: state
+    val shown = shownDemo
     val live = shown as? QuizUiState.Live
     val paused = live?.paused == true
 
@@ -316,16 +334,20 @@ fun QuizScreen(
             DebugBody(debug)
         } else {
             Column(modifier = Modifier.fillMaxWidth()) {
-                // 取景框只在「还没认出题」时占位：那正是用户需要对准的时候。
-                // 一旦出答案，120px 的取景条要吃掉 6 行选项原文，不划算——那时
-                // 题干本身就说明了"刚才拍的是哪一题"，用户照样能核对。
-                // 暂停时不显示：那时相机已解绑，框里只会是黑的。
-                if (cameraGranted && !paused && live?.hit == null) {
+                // 出了答案不收起取景框，只从 140dp 压到 100dp：用户要看得出相机还对着
+                // 哪一段（谁都不想让答案对到别的题上），同时把 40px 还给答案区。
+                // 关键是它始终留在组合里——一旦移出，PreviewView detach，CameraX 去重配
+                // surface 会撞 5000ms 超时，界面就卡住（踩过）。
+                if (cameraGranted && !paused) {
+                    val idle = live?.hit == null
                     CameraViewfinder(
                         view = previewView,
+                        height = if (idle) BareTokens.ViewfinderH else BareTokens.ViewfinderCompactH,
                         flash = flash,
                         onSize = { w, h ->
-                            if (cropEnabled && w > 0 && h > 0) {
+                            // 只认「还没出答案」时的高度来算裁剪比例：出答案后高度变成
+                            // 100dp，按它算会把识别区裁得更窄，反而认不出，来回抖。
+                            if (cropEnabled && idle && w > 0 && h > 20) {
                                 viewModel.setViewfinderAspect(w.toFloat() / h)
                             }
                         },
@@ -336,7 +358,7 @@ fun QuizScreen(
                     state = shown,
                     paused = paused,
                     onRequestCamera = onRequestCamera,
-                    withViewfinder = cameraGranted && !paused && live?.hit == null,
+                    withViewfinder = cameraGranted && !paused,
                 )
             }
         }
@@ -520,8 +542,9 @@ private fun MainBody(
             } else {
                 Column(modifier = Modifier.fillMaxWidth()) {
                     // 选项原文、简答与计算题的答案动辄上百字，480×640 一屏放不下：
-                    // 短答案维持 22sp 醒目；长答案降到 16sp，并把题干从 4 行压到 2 行，
-                    // 把省下来的高度全给答案。
+                    // 短答案维持 22sp 醒目；长答案降到 16sp，并把题干压到 1 行，
+                    // 把省下来的高度全给答案。上限 7 行是按"面板 329 − 取景框 84 −
+                    // 间隙/分隔线/说明行"倒推的，layout_preview.py 的 stress 用例卡的就是这条线。
                     val answerText = hit.answer.ifBlank { "（题库无答案）" }
                     val longAnswer = answerText.length > 30 || answerText.count { it == '\n' } > 1
                     Text(
@@ -541,7 +564,7 @@ private fun MainBody(
                         fontSize = if (longAnswer) BareTokens.AnswerSmallSp else BareTokens.AnswerSp,
                         lineHeight = if (longAnswer) BareTokens.AnswerSmallLineH else BareTokens.AnswerLineH,
                         fontWeight = FontWeight.Bold,
-                        maxLines = if (longAnswer) 10 else 3,
+                        maxLines = if (longAnswer) 7 else 3,
                         overflow = TextOverflow.Ellipsis,
                     )
                     Divider()
@@ -550,7 +573,7 @@ private fun MainBody(
                         color = NeonGreen,
                         fontSize = BareTokens.BodySp,
                         lineHeight = BareTokens.BodyLineH,
-                        maxLines = if (longAnswer) 2 else 4,
+                        maxLines = if (longAnswer) 1 else 4,
                         overflow = TextOverflow.Ellipsis,
                     )
                     Divider()

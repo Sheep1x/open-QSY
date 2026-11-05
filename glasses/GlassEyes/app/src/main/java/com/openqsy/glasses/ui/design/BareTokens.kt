@@ -57,6 +57,19 @@ object BareTokens {
      */
     val ViewfinderH = 140.dp
 
+    /**
+     * 已经出答案后取景框的高度。
+     *
+     * 这里踩过两个坑：把取景框整块移出组合，PreviewView 会 detach，CameraX 去重配
+     * surface 撞 5000ms 超时，界面卡住；压到 1dp 又让用户看不出相机对着哪一块，
+     * 想知道"刚才拍的是不是这道题"得按返回重来。
+     *
+     * 84dp 是折中：480 宽铺满时纵向露出整帧约 13%（140dp 时 22%），够看出对准的是
+     * 哪一段，同时把 56px 还给答案区（140→84）。再高（试过 100dp）就装不下 7 行长答案，
+     * layout_preview.py 的 stress 用例会溢出到图例上。
+     */
+    val ViewfinderCompactH = 84.dp
+
     val TitleSp = 15.sp
     val SubtitleSp = 11.sp
     val BodySp = 13.sp

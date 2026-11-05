@@ -219,6 +219,10 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
     private var lastMatchMs = 0L
     private var lastOcrChars = 0
     private var lastTopScores = "-"
+
+    /** 本次命中用的那段文字（中心窗口或整段），条件是「题被改过」校验的比对基准。 */
+    @Volatile
+    private var lastMatchText = ""
     private var lastOcrPreview = ""
     private var lastError: String? = null
     private var selfCheckText = "-"
@@ -449,6 +453,7 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
         val hits = searchAroundCenter(store, ocr)
         lastMatchMs = SystemClock.elapsedRealtime() - t0
         lastTopScores = hits.take(3).joinToString(" / ") { "%.2f".format(it.score) }
+        Log.d(TAG, "match ${lastMatchMs}ms top=${lastTopScores}")
 
         val confident = hits.filter { it.score >= MIN_SCORE }.take(MAX_CANDIDATES)
         val best = confident.firstOrNull()
@@ -456,6 +461,23 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
         if (best == null) {
             // 没到阈值：这张照片没认出题库里的题
             emitLive(hint = "题库里没找到 · 识别 ${lastOcrChars} 字")
+            return
+        }
+
+        // 4.5) 条件硬校验：题干里的数字、否定词跟题库原题对不上，多半是「同一考点但改了条件」。
+        // 这时把原题的答案端上去一定是错的，而且用户看不出来——宁可不给。
+        val conflict = conditionConflict(lastMatchText, best.stem)
+        if (conflict != null) {
+            Log.d(
+                TAG,
+                "条件不符（$conflict）q=${lastMatchText.replace('\n', ' ').take(80)} " +
+                    "| doc=${best.stem.replace('\n', ' ').take(80)}",
+            )
+            candidates = emptyList()
+            currentCandidate = 0
+            voteWindow.clear()
+            locked = false
+            emitLive(hint = "题干与题库不符（$conflict）· 不给答案")
             return
         }
 
@@ -486,7 +508,10 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
      */
     private fun searchAroundCenter(store: QBankStore, ocr: OcrOutcome): List<QuizHit> {
         val lines = ocr.lines
-        if (lines.size < 3) return store.search(ocr.text, topK = SEARCH_TOPK)
+        if (lines.size < 3) {
+            lastMatchText = ocr.text
+            return store.search(ocr.text, topK = SEARCH_TOPK)
+        }
 
         val sorted = lines.sortedBy { it.centerY }
         val centerIdx = sorted.indices.minByOrNull { abs(sorted[it].centerY - 0.5f) } ?: 0
@@ -506,6 +531,7 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
         var bestHits: List<QuizHit> = emptyList()
         var bestScore = 0f
         var bestLines = 0
+        var bestText = ""
         for (n in 2..minOf(MAX_WINDOW_LINES, order.size)) {
             val picked = order.take(n).sorted()
             val text = picked.joinToString("\n") { sorted[it].text }
@@ -517,6 +543,7 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
                 bestScore = top
                 bestHits = hits
                 bestLines = n
+                bestText = text
             }
         }
 
@@ -532,8 +559,71 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
         )
 
         // 窗口没把握时用整段；整段也没更好就还是窗口（窗口至少更"聚焦"）。
-        return if (bestScore <= 0f || fallbackScore > bestScore + 0.05f) fallback else bestHits
+        val useFallback = bestScore <= 0f || fallbackScore > bestScore + 0.05f
+        lastMatchText = if (useFallback) ocr.text else bestText
+        return if (useFallback) fallback else bestHits
     }
+
+    /**
+     * 比对「本次认到的文字」和「题库原题题干」里的硬条件。
+     *
+     * 只查两类能一票否决的东西：
+     * - 数字：题目里出现了题库原题没有的数字（改了金额、年限、利率、面积）；
+     * - 否定词：题目比原题多（或少）了「不 / 非 / 除外 / 错误」这类词
+     *   ——「属于」被改成「不属于」，答案正好相反。
+     *
+     * 方向基本是单向的：只报「题目有、原题没有」。反方向多半是 OCR 只截到了半句题干，
+     * 报出来全是误报。唯一例外是「少了否定词」：原题带否定词、而这一窗口几乎覆盖了整题，
+     * 那说明题目真被改过（用 [FULL_STEM_RATIO] 判断"几乎覆盖"）。
+     *
+     * @return null 表示没问题；否则返回一句给用户看的说明。
+     */
+    private fun conditionConflict(query: String, doc: String): String? {
+        if (query.isBlank() || doc.isBlank()) return null
+
+        // 选项行（"A. 12 万元"）里的数字不是题干的数字，先剔掉；题号、子问号同理。
+        val body = query.lines()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !OPTION_LINE.matches(it) }
+            .map { RE_LEADING_NO.replace(RE_SUBQ_NO.replace(it, ""), "") }
+            .joinToString("\n")
+        if (body.isBlank()) return null
+
+        // 否定词先查：它比数字可靠得多（OCR 掉个数字很常见，掉一个「不」罕见），
+        // 而且「属于 / 不属于」这类改动会直接把答案翻转。
+        val qNeg = negationTokens(body)
+        val dNeg = negationTokens(doc)
+
+        val qOnly = qNeg - dNeg
+        if (qOnly.isNotEmpty()) return "多了「${qOnly.sorted().joinToString("")}」"
+
+        val qLen = body.count { !it.isWhitespace() }
+        val dLen = doc.count { !it.isWhitespace() }
+        val covered = dLen > 0 && qLen >= dLen * FULL_STEM_RATIO
+        val dOnly = dNeg - qNeg
+        if (covered && dOnly.isNotEmpty()) return "少了「${dOnly.sorted().joinToString("")}」"
+
+        val qNums = numberTokens(body)
+        val dNums = numberTokens(doc)
+        if (qNums.isNotEmpty() && dNums.isNotEmpty()) {
+            // 认残的数字（"2018" 被截成 "2"）是原题数字的前缀/后缀，不算新增
+            val extra = qNums.filter { q ->
+                dNums.none { d -> d == q || d.startsWith(q) || d.endsWith(q) }
+            }
+            if (extra.isNotEmpty()) return "数字 ${extra.sorted().take(3).joinToString("、")} 对不上"
+        }
+
+        return null
+    }
+
+    /** 题干里的数字集合；`12.50` 与 `12.5` 视为同一个数，`12000` 不受尾零影响。 */
+    private fun numberTokens(text: String): Set<String> =
+        NUMBER.findAll(text).map { m ->
+            val raw = m.value
+            if (raw.contains('.')) raw.trimEnd('0').trimEnd('.') else raw
+        }.filter { it.isNotEmpty() }.toSet()
+
+    private fun negationTokens(text: String): Set<String> = NEGATION.findAll(text).map { it.value }.toSet()
 
     private fun emitLive(hint: String) {
         val shown = candidates.getOrNull(currentCandidate)
@@ -660,7 +750,9 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
                 bmp.recycle()
                 return@launch
             }
-            val aspect = if (viewfinderAspect > 0f) viewfinderAspect else DEFAULT_BOX_ASPECT
+            // 离屏验收时默认认整帧：取景框比例来自界面实测，没界面时按 0 处理就是不裁。
+            // 要复现相机那条裁剪路径，先用相机跑一次让 viewfinderAspect 有值即可。
+            val aspect = viewfinderAspect
             val ocr = ml.recognizeBitmap(bmp, aspect)
             bmp.recycle()
             Log.i(
@@ -677,6 +769,40 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
                 hits.take(3).forEachIndexed { i, h ->
                     Log.i(TAG, "  hit[$i] %.3f #%d %s".format(h.score, h.docId, h.stem.take(50)))
                 }
+                // 验收口径：把离屏识别的结果也推给界面。作用是复现"相机正在跑 → 突然出答案"
+                // 这一跳，用来验证出答案时相机会话被干净解绑（否则 CameraX 会去重配 surface，
+                // 界面上就表现为"识别成功后卡住"）。平时这条路径只在 --es ocrimg 时走到。
+                // 与 handleFrame 走同一条硬校验：条件对不上就不给答案
+                val best = hits.firstOrNull()
+                val conflict = if (best != null && best.score >= MIN_SCORE) {
+                    conditionConflict(lastMatchText, best.stem)
+                } else {
+                    null
+                }
+                if (best != null && conflict != null) {
+                    Log.i(
+                        TAG,
+                        "条件不符（$conflict）q=${lastMatchText.replace('\n', ' ').take(80)} " +
+                            "| doc=${best.stem.replace('\n', ' ').take(80)}",
+                    )
+                    candidates = emptyList()
+                    currentCandidate = 0
+                    locked = false
+                    lastOcrChars = ocr.text.length
+                    lastOcrMs = ocr.elapsedMs
+                    lastOcrPreview = ocr.text.take(400)
+                    emitLive(hint = "题干与题库不符（$conflict）· 不给答案")
+                    return@launch
+                }
+                candidates = hits
+                currentCandidate = 0
+                locked = hits.isNotEmpty()
+                lastOcrChars = ocr.text.length
+                lastOcrMs = ocr.elapsedMs
+                lastOcrPreview = ocr.text.take(400)
+                emitLive(hint = if (hits.isEmpty()) "题库里没找到 · 识别 ${ocr.text.length} 字" else "")
+                val nowHit = (_state.value as? QuizUiState.Live)?.hit
+                Log.i(TAG, "ocrimg emit: cands=${candidates.size} hitDoc=${nowHit?.docId} hitScore=${nowHit?.score}")
             }
         }
     }
@@ -833,8 +959,15 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
         const val TAG = "SolveViewModel"
         const val MAX_CANDIDATES = 3
 
-        /** 每次检索取多少个候选（够翻页，也不至于算太久）。 */
-        const val SEARCH_TOPK = 20
+        /**
+         * 每次检索取多少个候选。
+         *
+         * 只要够翻页即可：界面最多展示 [MAX_CANDIDATES] 个，窗口打分只用到第 1 名的分数。
+         * 这个值直接决定检索耗时——`QBankStore.search` 的 topK 是"逐个挑最大"的线性选择，
+         * 总比较次数 = topK × 题数。20 时一次 6600 题要扫 13 万次，一拍照片还要跑 5~6 个窗口；
+         * 降到 6 后同样一拍减少约七成比较。
+         */
+        const val SEARCH_TOPK = 6
 
         /** 中心窗口最多取几行去检索：再长就跨到隔壁题去了。 */
         const val MAX_WINDOW_LINES = 6
@@ -847,6 +980,23 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
 
         /** 低于此分值视为「没扫到」，不刷新答案（防乱跳）。 */
         const val MIN_SCORE = 0.55f
+
+        /** 选项行（`A. 12 万元`）里的数字不属于题干，做条件校验前先剔掉。 */
+        val OPTION_LINE = Regex("^[A-FＡ-Ｆa-f][.、．)）].*")
+
+        /** 行首题号：`12.` / `12、`。 */
+        val RE_LEADING_NO = Regex("^\\d+[.、]\\s*")
+
+        /** 子问标记：`（1）`。 */
+        val RE_SUBQ_NO = Regex("[（(]\\s*\\d{1,2}\\s*[）)]")
+
+        val NUMBER = Regex("\\d+(?:\\.\\d+)?")
+
+        /** 否定标记——多一个少一个都可能把答案整个翻转，所以都算硬条件。 */
+        val NEGATION = Regex("不正确|不属于|不包括|不能|不得|不宜|除外|除了|错误|不|无|非")
+
+        /** 认到的文字至少要覆盖原题题干这个比例，才敢就「少了否定词」下结论。 */
+        const val FULL_STEM_RATIO = 0.75f
 
         /**
          * 拍照节奏：每 3 秒拍一张。

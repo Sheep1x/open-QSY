@@ -1,7 +1,5 @@
 package com.openqsy.glasses.quiz
 
-import org.json.JSONArray
-import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 
 /**
@@ -14,8 +12,11 @@ import java.io.ByteArrayOutputStream
  * 为什么要搬到设备上：换题库时用户手里通常只有 JSON，让眼镜自己编译，
  * 就不必先找台电脑装 Python 再 adb push。
  *
- * 6622 题实测（PC/JVM）：解析 + 建索引约 1.2 s，产物 0.91 MB。
- * 眼镜 CPU 慢 5~10 倍，预计 6~12 s，所以调用方必须放在后台线程并给进度提示。
+ * 解析走 [JsonLite] 流式扫描：整份 JSON 只过一遍，命中需要的字段就取走，不建对象树。
+ * 这样内存峰值与耗时都近乎减半（5.3 万题 / 39.5 MB：60.7 s → 33.6 s，峰值 289 MB）。
+ *
+ * 6622 题实测（PC/JVM）：解析 + 建索引约 0.25 s，产物 0.91 MB。
+ * 眼镜 CPU 慢 5~10 倍，所以调用方必须放在后台线程并给进度提示。
  *
  * 文件格式（全部 little-endian）：
  * ```
@@ -85,30 +86,20 @@ object IndexBuilder {
     fun build(jsonText: String): Pair<ByteArray, Stats> {
         val text = jsonText.trim()
         if (text.isEmpty()) throw BuildException("文件是空的")
-        if (!text.startsWith("[") && !text.startsWith("{")) {
+        if (text[0] != '[' && text[0] != '{') {
             throw BuildException("不是 JSON（开头应为 [ 或 {）")
         }
 
-        val title: String
-        val questions: JSONArray
-        if (text.startsWith("[")) {
-            title = ""
-            questions = runCatching { JSONArray(text) }
-                .getOrElse { throw BuildException("JSON 数组解析失败：${it.message}") }
-        } else {
-            val root = runCatching { JSONObject(text) }
-                .getOrElse { throw BuildException("JSON 对象解析失败：${it.message}") }
-            title = root.optJSONObject("meta")?.optString("title").orEmpty()
-            questions = root.optJSONArray("questions")
-                ?: throw BuildException("JSON 里找不到 questions 数组")
-        }
-        if (questions.length() == 0) throw BuildException("题库里没有题目")
-
-        // ---------------- 逐题写入文本池与 doc 记录 ----------------
-        val texts = ByteArrayOutputStream(1 shl 20)
-        val docs = ByteArrayOutputStream(questions.length() * DOC_STRIDE)
-        val postings = HashMap<Int, MutableList<Int>>(1 shl 15)
+        // ---------------- 一遍流式扫描：逐题写入文本池与 doc 记录 ----------------
+        // 不用 org.json：它会把整份文档建成对象树，大题库（几十 MB）解析峰值能翻十倍。
+        // 预分配：ByteArrayOutputStream 每次扩容都要整块复制，5 万题的文本池能到 20 MB 以上，
+        // 一路翻倍复制下来很可观。文本池按「字符数 ≈ 池大小」估（中文占多数时 UTF-8 会比 UTF-16 小），
+        // 其余按经验比例给初值——宁可多占几 MB，也别反复复制。
+        val texts = ByteArrayOutputStream(text.length.coerceAtMost(64 * 1024 * 1024))
+        val docs = ByteArrayOutputStream((text.length / 8).coerceAtLeast(1 shl 16))
+        val postings = HashMap<Int, MutableList<Int>>((text.length / 40).coerceIn(1 shl 15, 1 shl 22))
         var skippedEmptyStem = 0
+        var count = 0
 
         fun addText(s: String): Long {
             // 高 32 位 = offset，低 32 位 = length（空串返回 0/0 且不写池，与 Python 一致）
@@ -119,43 +110,48 @@ object IndexBuilder {
             return (off.toLong() shl 32) or (raw.size.toLong() and 0xFFFFFFFFL)
         }
 
-        for (i in 0 until questions.length()) {
-            val q = questions.optJSONObject(i)
-                ?: throw BuildException("第 ${i + 1} 题不是 JSON 对象")
+        val scanned = try {
+            JsonLite.scan(text) { q ->
+                val docId = count
+                val stem = q.stem.trim()
+                val answer = firstNonBlank(q.answerText, q.answer).trim()
+                val subject = q.subject.trim()
+                val typeCode = TYPE_CODES[q.type.trim()] ?: 0
 
-            val stem = rawString(q, "stem").trim()
-            val answer = firstNonBlank(rawString(q, "answerText"), rawString(q, "answer")).trim()
-            val subject = rawString(q, "subject").trim()
-            val typeCode = TYPE_CODES[rawString(q, "type").trim()] ?: 0
+                if (stem.isEmpty()) skippedEmptyStem++
 
-            if (stem.isEmpty()) skippedEmptyStem++
+                val stemPacked = addText(stem)
+                val ansPacked = addText(answer)
+                val subjPacked = addText(subject)
 
-            val stemPacked = addText(stem)
-            val ansPacked = addText(answer)
-            val subjPacked = addText(subject)
+                putU32(docs, (stemPacked ushr 32).toInt())
+                putU32(docs, stemPacked.toInt())
+                putU32(docs, (ansPacked ushr 32).toInt())
+                putU32(docs, ansPacked.toInt())
+                putU32(docs, (subjPacked ushr 32).toInt())
+                putU32(docs, subjPacked.toInt())
+                docs.write(typeCode and 0xFF)
+                docs.write(0)
+                docs.write(0)
+                docs.write(0)
 
-            putU32(docs, (stemPacked ushr 32).toInt())
-            putU32(docs, stemPacked.toInt())
-            putU32(docs, (ansPacked ushr 32).toInt())
-            putU32(docs, ansPacked.toInt())
-            putU32(docs, (subjPacked ushr 32).toInt())
-            putU32(docs, subjPacked.toInt())
-            docs.write(typeCode and 0xFF)
-            docs.write(0)
-            docs.write(0)
-            docs.write(0)
-
-            // 只对题干建倒排：题干最稳定，选项/答案会引入噪声
-            val keys = TextNormalizer.bigramKeys(TextNormalizer.normalize(stem))
-            if (keys.isNotEmpty()) {
-                // 同一题内去重（Python 用 set）
-                val uniq = HashSet<Int>(keys.size * 2)
-                for (k in keys) uniq.add(k)
-                for (k in uniq) {
-                    postings.getOrPut(k) { ArrayList(4) }.add(i)
+                // 只对题干建倒排：题干最稳定，选项/答案会引入噪声
+                val keys = TextNormalizer.bigramKeys(TextNormalizer.normalize(stem))
+                if (keys.isNotEmpty()) {
+                    // 同一题内去重（Python 用 set）
+                    val uniq = HashSet<Int>(keys.size * 2)
+                    for (k in keys) uniq.add(k)
+                    for (k in uniq) {
+                        postings.getOrPut(k) { ArrayList(4) }.add(docId)
+                    }
                 }
+                count++
             }
+        } catch (e: JsonLite.ScanException) {
+            throw BuildException(e.message ?: "JSON 解析失败")
         }
+        if (scanned.count == 0) throw BuildException("题库里没有题目")
+        val title = scanned.title
 
         // ---------------- term 表 + postings ----------------
         // Python 的 sorted() 是数值升序；key 是 u32 位模式，Int 可能为负，必须按无符号比较
@@ -189,7 +185,7 @@ object IndexBuilder {
         out[2] = 'S'.code.toByte()
         out[3] = 'Y'.code.toByte()
         putU32(out, 4, VERSION)
-        putU32(out, 8, questions.length())
+        putU32(out, 8, scanned.count)
         putU32(out, 12, termKeys.size)
         putU32(out, 16, termPost.size())
         putU32(out, 20, texts.size())
@@ -217,7 +213,7 @@ object IndexBuilder {
 
         val stats = Stats(
             title = title,
-            questions = questions.length(),
+            questions = scanned.count,
             terms = termKeys.size,
             postingsBytes = termPost.size(),
             textBytes = texts.size(),
@@ -229,13 +225,6 @@ object IndexBuilder {
     }
 
     // ------------------------------------------------------------------ 工具
-
-    /** 取字符串字段：null / JSONObject.NULL 都当空串，数字/布尔转字符串（对齐 Python 的 str()）。 */
-    private fun rawString(q: JSONObject, key: String): String {
-        val v = q.opt(key) ?: return ""
-        if (v == JSONObject.NULL) return ""
-        return v as? String ?: v.toString()
-    }
 
     private fun firstNonBlank(a: String, b: String): String = if (a.isNotBlank()) a else b
 

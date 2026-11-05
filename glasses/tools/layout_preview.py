@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 480x640 单绿屏布局模拟器。
@@ -32,7 +32,8 @@ LEGEND_ROW_H = 18
 LEGEND_BADGE_H = 16
 PANEL_PAD = 10
 LINE_GAP = 6
-VIEWFINDER_H = 140      # 相机取景框，对应 BareTokens.ViewfinderH
+VIEWFINDER_H = 140      # 相机取景框（还没出答案），对应 BareTokens.ViewfinderH
+VIEWFINDER_COMPACT_H = 84  # 出了答案后的取景框（缩一档但仍可见），对应 BareTokens.ViewfinderCompactH
 PANEL_VPAD = 4          # BareContentPanel 的 padding(vertical = 4.dp)
 DIVIDER_VPAD = 4        # Divider 的 padding(vertical = 4.dp)
 
@@ -311,7 +312,7 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cases = {
-        "hit": build_main_page(True, "", False),
+        "hit": build_main_page(True, "", False, viewfinder_h=VIEWFINDER_COMPACT_H),
         # 最坏情况：答案 3 行 + 题干 4 行 + OCR 5 行全部占满
         "worst": build_main_page(
             True,
@@ -319,6 +320,7 @@ def main() -> int:
             False,
             answer_text="B。因为加速度方向与速度方向相反，速度不断减小但加速度保持不变，"
                         "所以小球做匀减速直线运动直到速度为零，之后保持静止状态不再运动。",
+            viewfinder_h=VIEWFINDER_COMPACT_H,
             stem_text="一小球沿倾角为三十度的光滑斜面由静止开始下滑，下列说法中正确的是（　）"
                       "A 小球的加速度大小为 g　B 小球的加速度大小为 g·sin30°　"
                       "C 小球的机械能守恒　D 小球的动量守恒",
@@ -337,8 +339,9 @@ def main() -> int:
             stem_text="关于土地使用权出让年限届满后的处理，下列说法正确的是（　）",
             answer_sp=16,
             answer_lh=21,
-            answer_max=10,
-            stem_max=2,
+            answer_max=7,
+            stem_max=1,
+            viewfinder_h=VIEWFINDER_COMPACT_H,
         ),
         # 压力测试：答案远超 10 行上限，必须被截断而不是把下面的内容顶出面板
         "stress": build_main_page(
@@ -355,8 +358,9 @@ def main() -> int:
             stem_text="某房地产开发项目，请计算其净收益与开发价值。",
             answer_sp=16,
             answer_lh=21,
-            answer_max=10,
-            stem_max=2,
+            answer_max=7,
+            stem_max=1,
+            viewfinder_h=VIEWFINDER_COMPACT_H,
         ),
     }
 

@@ -16,8 +16,14 @@ import java.net.URL
  */
 object BankDownloader {
 
-    /** 题库再大也不会超过这个数；超了必然是扫错了链接（比如扫到视频）。 */
-    const val MAX_BYTES: Long = 40L * 1024 * 1024
+    /**
+     * 单份题库的体积上限：64 MB（约 8 万题，按实测 ~800 B/题折算）。
+     *
+     * 定这个数不是拍脑袋——约束在**设备端编译时的内存**，不在下载：
+     * 眼镜可用内存约 800 MB，编译一份 40 MB 的 JSON 峰值约 350 MB（文本要整份读成 String，
+     * 文本池再存一份），再往上就贴着系统 OOM 线了。超过这条线就请拆成两份题库轮换用。
+     */
+    const val MAX_BYTES: Long = 64L * 1024 * 1024
 
     private const val TIMEOUT_MS = 20_000
 

@@ -29,3 +29,4 @@ report*.txt
 题库合并.json
 /shots/
 glasses/shots/qbank-full.json
+glasses/shots/*.idx

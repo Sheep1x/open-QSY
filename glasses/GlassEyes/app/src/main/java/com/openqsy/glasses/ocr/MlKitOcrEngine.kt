@@ -36,15 +36,19 @@ class MlKitOcrEngine : OcrEngine {
         visibleAspect: Float,
     ): OcrOutcome = withContext(Dispatchers.Default) {
         val t0 = SystemClock.elapsedRealtime()
-        var mid: Bitmap? = null
-        var cut: Bitmap? = null
+        var keep: Bitmap? = null
+        var tPrep = t0
         try {
-            val media = image.image ?: return@withContext OcrOutcome("", 0, "相机帧为空")
             val rotation = image.imageInfo.rotationDegrees
+            val input: InputImage
+            val frameH: Float
 
-            val input = if (visibleAspect <= 0f) {
+            if (visibleAspect <= 0f) {
                 // 整帧：直接把相机缓冲交给 ML Kit，零拷贝。
-                InputImage.fromMediaImage(media, rotation)
+                // 缓冲必须活到识别结束，所以这里不能提前 close。
+                val media = image.image ?: return@withContext OcrOutcome("", 0, "相机帧为空")
+                frameH = media.height.toFloat().coerceAtLeast(1f)
+                input = InputImage.fromMediaImage(media, rotation)
             } else {
                 // 只认取景框里那一块。整帧宽高比和取景框不一样，
                 // 屏幕上看到的是「整宽 × 纵向中间一段」，这里裁出同一块再识别，
@@ -55,21 +59,30 @@ class MlKitOcrEngine : OcrEngine {
                         elapsedMs = SystemClock.elapsedRealtime() - t0,
                         error = "取帧失败",
                     )
+                // 相机缓冲到这里就用完了，立刻还回去。
+                // ML Kit 每次要 400~800 ms，若等它跑完才 close，这块 buffer 就一直占着，
+                // 相机流水线跟着停——用户看到的就是「每拍一张卡一下」。
+                // 后面的识别只对着内存里的位图做，与相机无关。
+                runCatching { image.close() }
+
                 val upright = if (rotation == 0) full else {
                     val m = Matrix().apply { postRotate(rotation.toFloat()) }
                     Bitmap.createBitmap(full, 0, 0, full.width, full.height, m, true)
-                        .also { if (it !== full) { full.recycle(); mid = it } }
+                        .also { if (it !== full) full.recycle() }
                 }
-                if (rotation != 0 && upright === full) mid = null
                 val shot = cropToViewfinder(upright, visibleAspect)
-                    .also { if (it !== upright) cut = it }
-                InputImage.fromBitmap(shot, 0)
+                if (shot !== upright) upright.recycle()
+                // 这张要等识别结束才能回收
+                keep = shot
+                frameH = shot.height.toFloat().coerceAtLeast(1f)
+                input = InputImage.fromBitmap(shot, 0)
             }
 
+            tPrep = SystemClock.elapsedRealtime()
             val result = Tasks.await(recognizer.process(input))
-            val frameH = (cut?.height ?: mid?.height ?: media.height)
-                .toFloat().coerceAtLeast(1f)
-            toOutcome(result, frameH, SystemClock.elapsedRealtime() - t0)
+            val ms = SystemClock.elapsedRealtime() - t0
+            Log.d(TAG, "timing: prep=${tPrep - t0}ms ocr=${SystemClock.elapsedRealtime() - tPrep}ms")
+            toOutcome(result, frameH, ms)
         } catch (t: Throwable) {
             Log.e(TAG, "ML Kit OCR 失败", t)
             OcrOutcome(
@@ -78,9 +91,8 @@ class MlKitOcrEngine : OcrEngine {
                 error = t.message ?: t.javaClass.simpleName,
             )
         } finally {
-            cut?.recycle()
-            mid?.recycle()
-            // 必须释放，否则下一次取帧会因缓冲区耗尽而阻塞。
+            keep?.recycle()
+            // 必须释放，否则下一次取帧会因缓冲区耗尽而阻塞（重复 close 是幂等的）。
             // 这也是这一帧唯一的出口：不存文件、不上传，只留下文字。
             runCatching { image.close() }
         }
@@ -147,6 +159,7 @@ class MlKitOcrEngine : OcrEngine {
      * 返回的位图若与入参是同一个对象，调用方**不要**回收它。
      */
     private fun cropToViewfinder(upright: Bitmap, boxAspect: Float): Bitmap {
+        if (boxAspect <= 0f) return upright
         val frameAspect = upright.height.toFloat() / upright.width.toFloat()
         val visibleFraction = (1f / boxAspect) / frameAspect
         val cropH = (upright.height * visibleFraction).toInt()
