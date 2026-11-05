@@ -2,6 +2,7 @@ package com.openqsy.glasses.ocr
 
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.graphics.Rect
 import android.os.SystemClock
 import android.util.Log
 import androidx.camera.core.ImageProxy
@@ -12,6 +13,7 @@ import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.nio.ByteBuffer
 
 /**
  * ML Kit 中文文字识别（**模型内置于 APK，纯离线，不需要网络，不需要 Play 服务**）。
@@ -53,29 +55,39 @@ class MlKitOcrEngine : OcrEngine {
                 // 只认取景框里那一块。整帧宽高比和取景框不一样，
                 // 屏幕上看到的是「整宽 × 纵向中间一段」，这里裁出同一块再识别，
                 // 否则框外的相邻题目也会被认进来，答案就会跑到别的题上去。
-                val full = runCatching { image.toBitmap() }.getOrNull()
-                    ?: return@withContext OcrOutcome(
+                //
+                // 走 NV21 而不是 Bitmap：`ImageProxy.toBitmap()` 会把**整帧**做一遍
+                // YUV→ARGB（1.5 MP 要 130~150 ms，实测 setCropRect 并不影响它的开销），
+                // 而这里只把取景框那一条的 Y/UV 拷出来（0.37 MP，20~40 ms），转换与旋转
+                // 都交给 ML Kit 自己做——省掉整整一步，也省掉一张 Bitmap 的分配。
+                val rect = viewfinderRect(image, visibleAspect)
+                val turned = rotation == 90 || rotation == 270
+                // 交给 ML Kit 的是「未转正」的图 + rotation，它给出的坐标是转正之后的
+                val frameH = (if (turned) rect.width() else rect.height()).toFloat().coerceAtLeast(1f)
+                val nv21 = runCatching { cropToNv21(image, rect) }.getOrNull()
+                // 相机缓冲到这里就用完了，立刻还回去。
+                // ML Kit 每次要几百毫秒，若等它跑完才 close，这块 buffer 就一直占着，
+                // 相机流水线跟着停——用户看到的就是「每拍一张卡一下」。
+                runCatching { image.close() }
+                if (nv21 == null) {
+                    return@withContext OcrOutcome(
                         text = "",
                         elapsedMs = SystemClock.elapsedRealtime() - t0,
                         error = "取帧失败",
                     )
-                // 相机缓冲到这里就用完了，立刻还回去。
-                // ML Kit 每次要 400~800 ms，若等它跑完才 close，这块 buffer 就一直占着，
-                // 相机流水线跟着停——用户看到的就是「每拍一张卡一下」。
-                // 后面的识别只对着内存里的位图做，与相机无关。
-                runCatching { image.close() }
-
-                val upright = if (rotation == 0) full else {
-                    val m = Matrix().apply { postRotate(rotation.toFloat()) }
-                    Bitmap.createBitmap(full, 0, 0, full.width, full.height, m, true)
-                        .also { if (it !== full) full.recycle() }
                 }
-                val shot = cropToViewfinder(upright, visibleAspect)
-                if (shot !== upright) upright.recycle()
-                // 这张要等识别结束才能回收
-                keep = shot
-                frameH = shot.height.toFloat().coerceAtLeast(1f)
-                input = InputImage.fromBitmap(shot, 0)
+                input = InputImage.fromByteBuffer(
+                    nv21,
+                    rect.width(),
+                    rect.height(),
+                    rotation,
+                    InputImage.IMAGE_FORMAT_NV21,
+                )
+                tPrep = SystemClock.elapsedRealtime()
+                val result = Tasks.await(recognizer.process(input))
+                val ms = SystemClock.elapsedRealtime() - t0
+                Log.d(TAG, "timing: prep=${tPrep - t0}ms ocr=${SystemClock.elapsedRealtime() - tPrep}ms")
+                return@withContext toOutcome(result, frameH, ms)
             }
 
             tPrep = SystemClock.elapsedRealtime()
@@ -147,6 +159,122 @@ class MlKitOcrEngine : OcrEngine {
                 else OcrLine(t, (box.centerY() / frameH).coerceIn(0f, 1f))
             }
         return OcrOutcome(text = result.text, elapsedMs = ms, lines = lines)
+    }
+
+    /**
+     * 算出「取景框里那一条」在**未旋转**相机坐标系里的矩形，交给 `ImageProxy.setCropRect`。
+     *
+     * 取景框是 480×H 的横向框，相机帧是竖构图，`FILL_CENTER` 的缩放系数由宽度定死，
+     * 所以屏幕上露出的是**整宽、纵向居中、一段**。这段在原始横构图里是一条竖条，
+     * 按 `rotationDegrees` 换算过去就是 RotatedRect 的映射：
+     *
+     * - `rotation = 90`：`dst(x,y) ← src(y, H-1-x)`
+     * - `rotation = 180`：`dst(x,y) ← src(W-1-x, H-1-y)`
+     * - `rotation = 270`：`dst(x,y) ← src(W-1-y, x)`
+     *
+     * 90 与 270 结果相同——居中横条左右对称，只是朝向不同。
+     */
+    private fun viewfinderRect(image: ImageProxy, boxAspect: Float): Rect {
+        val w = image.width
+        val h = image.height
+        val rotation = image.imageInfo.rotationDegrees
+        val turned = rotation == 90 || rotation == 270
+        val upW = if (turned) h else w
+        val upH = if (turned) w else h
+
+        val frameAspect = upH.toFloat() / upW.toFloat().coerceAtLeast(1f)
+        val visibleFraction = (1f / boxAspect) / frameAspect
+        val cropH = (upH * visibleFraction).toInt().coerceIn(64, upH)
+        val top = ((upH - cropH) / 2).coerceAtLeast(0)
+
+        val x0 = 0
+        val x1 = upW
+        val y0 = top
+        val y1 = (top + cropH).coerceAtMost(upH)
+        val rect = when (rotation) {
+            90 -> Rect(y0, h - x1, y1, h - x0)
+            180 -> Rect(w - x1, h - y1, w - x0, h - y0)
+            270 -> Rect(w - y1, x0, w - y0, x1)
+            else -> Rect(x0, y0, x1, y1)
+        }
+        // NV21 的色度是 2×2 采样，起止必须落在偶数边界上，否则颜色会串行
+        val aligned = Rect(
+            (rect.left and 1.inv()).coerceIn(0, w - 2),
+            (rect.top and 1.inv()).coerceIn(0, h - 2),
+            ((rect.right + 1) and 1.inv()).coerceIn(2, w),
+            ((rect.bottom + 1) and 1.inv()).coerceIn(2, h),
+        )
+        Log.d(
+            TAG,
+            "crop: frame=${w}x$h rot=$rotation up=${upW}x$upH " +
+                "boxAspect=$boxAspect frac=$visibleFraction cropH=$cropH top=$top rect=$aligned",
+        )
+        return aligned
+    }
+
+    /**
+     * 把 [rect] 范围内的 YUV_420_888 拷成一块 NV21，直接交给 ML Kit。
+     *
+     * NV21 排布是「w×h 个 Y，后面跟 (w/2)×(h/2) 个 VU 对」。相机给的三个 plane 各有
+     * 自己的 rowStride / pixelStride（UV 常见是 2 像素交错），所以不能整块 memcpy，
+     * 得按 stride 逐行取。0.37 MP 在 Kotlin 里约 20~40 ms。
+     */
+    private fun cropToNv21(image: ImageProxy, rect: Rect): ByteBuffer {
+        val w = rect.width()
+        val h = rect.height()
+        val yP = image.planes[0]
+        val uP = image.planes[1]
+        val vP = image.planes[2]
+        val yb = yP.buffer
+        val ub = uP.buffer
+        val vb = vP.buffer
+        val yRow = yP.rowStride
+        val yPix = yP.pixelStride
+        val uRow = uP.rowStride
+        val uPix = uP.pixelStride
+        val vRow = vP.rowStride
+        val vPix = vP.pixelStride
+
+        val arr = ByteArray(w * h * 3 / 2)
+        var k = 0
+        for (y in 0 until h) {
+            var yi = (y + rect.top) * yRow + rect.left * yPix
+            repeat(w) {
+                arr[k++] = yb.get(yi)
+                yi += yPix
+            }
+        }
+        for (y in 0 until h step 2) {
+            val row = (y + rect.top) / 2
+            var ui = row * uRow + (rect.left / 2) * uPix
+            var vi = row * vRow + (rect.left / 2) * vPix
+            repeat(w / 2) {
+                arr[k++] = vb.get(vi)
+                arr[k++] = ub.get(ui)
+                ui += uPix
+                vi += vPix
+            }
+        }
+        return ByteBuffer.allocateDirect(arr.size).apply {
+            put(arr)
+            rewind()
+        }.also {
+            // 诊断：确认拷出来的确实是画面内容（全 0 / 全 255 说明 stride 算错了）
+            var sum = 0L
+            var n = 0
+            var mn = 255
+            var mx = 0
+            var i = 0
+            while (i < w * h) {
+                val v = arr[i].toInt() and 0xFF
+                sum += v
+                n++
+                if (v < mn) mn = v
+                if (v > mx) mx = v
+                i += 17
+            }
+            Log.d(TAG, "nv21: ${w}x$h Y avg=${sum / n.coerceAtLeast(1)} min=$mn max=$mx")
+        }
     }
 
     /**
