@@ -9,10 +9,11 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * OpenAI 兼容端点的最小客户端：列模型 + 单轮问答。
+ * OpenAI 端点最小客户端：列模型 + 单轮问答。
  *
+ * 提问走 Responses 协议（`/responses`），服务端不支持时退回 `chat/completions`。
  * 刻意不引 OkHttp/Retrofit——APK 已经 72 MB，这是两条 HTTP 请求的事。
- * 也刻意不用流式：眼镜上只有一块小屏，答案要完整一段才好排版，`stream=false` 更省事。
+ * 也刻意不用流式：眼镜上只有一块小屏，答案要完整一段才好排版。
  */
 object AiClient {
     private const val TAG = "AiClient"
@@ -72,31 +73,110 @@ object AiClient {
     /**
      * 问一道题。[question] 是 OCR 认到的原文。
      *
-     * 返回模型给的正文（已去掉首尾空白）。
+     * 走 OpenAI 的 Responses 协议（`POST {base}/responses`）。服务端没有这个接口时
+     * （404/405/501，例如只实现了 chat 兼容层的中转站）自动退回 `chat/completions`。
+     *
+     * 返回模型给的正文（已去掉首尾空白、已截到 [MAX_ANSWER_LINES] 行）。
      */
     fun ask(config: AiConfig, question: String): String {
         if (!config.enabled) throw AiException("没有配置 AI")
-        val url = config.endpoint("/chat/completions")
-        // 先请求「关掉思考」。实测 deepseek 的推理型号默认会用五千多个思考 token（90 秒）
-        // 才肯出正文，关掉之后 3.5~7 秒就答完，且正文更简明。
         val text = try {
-            request(url, "POST", config.apiKey, buildPayload(config, question, true), CHAT_TIMEOUT_MS)
+            request(
+                config.endpoint("/responses"),
+                "POST",
+                config.apiKey,
+                buildResponsesPayload(config, question),
+                CHAT_TIMEOUT_MS,
+            )
+        } catch (e: AiException) {
+            val msg = e.message.orEmpty()
+            if (msg.startsWith("HTTP 404") || msg.startsWith("HTTP 405") || msg.startsWith("HTTP 501")) {
+                Log.i(TAG, "服务端没有 /responses，退回 /chat/completions：$msg")
+                return askChat(config, question)
+            }
+            throw e
+        }
+        val root = jsonOf(text)
+        errorMessageOf(root)?.let { throw AiException(it) }
+
+        // output[] 里既有 reasoning 项也有 message 项，只取 message 里的 output_text
+        val output = root.optJSONArray("output")
+        if (output == null) {
+            // 有些网关把 /responses 转发到 chat 实现，回的仍是 chat 格式
+            if (root.has("choices")) {
+                Log.i(TAG, "/responses 回的是 chat 格式，按 chat 解析")
+                return parseChatRoot(root)
+            }
+            throw AiException("返回里没有 output")
+        }
+        val body = StringBuilder()
+        var reasoningChars = 0
+        for (i in 0 until output.length()) {
+            val item = output.optJSONObject(i) ?: continue
+            when (item.optString("type")) {
+                "reasoning" -> reasoningChars += item.toString().length
+                "message" -> {
+                    val content = item.optJSONArray("content") ?: continue
+                    for (j in 0 until content.length()) {
+                        val part = content.optJSONObject(j) ?: continue
+                        val type = part.optString("type")
+                        if (type == "output_text" || type == "text") body.append(part.optString("text"))
+                    }
+                }
+            }
+        }
+        // 少数网关会把 SDK 的便利字段也一起吐出来
+        var content = body.toString().trim()
+        if (content.isEmpty()) content = root.optString("output_text").trim()
+
+        if (content.isEmpty()) {
+            Log.w(TAG, "空内容原始返回：${root.toString().take(900)}")
+            throw AiException(
+                describeEmptyResponse(
+                    status = root.optString("status"),
+                    incomplete = root.optJSONObject("incomplete_details")?.optString("reason").orEmpty(),
+                    reasoningTokens = root.optJSONObject("usage")
+                        ?.optJSONObject("output_tokens_details")
+                        ?.optInt("reasoning_tokens", 0) ?: 0,
+                    sawReasoning = reasoningChars > 0,
+                ),
+            )
+        }
+        Log.i(
+            TAG,
+            "responses ok: ${root.optString("model")} status=${root.optString("status")} " +
+                "chars=${content.length} reasoning=$reasoningChars",
+        )
+        return limitLines(content, MAX_ANSWER_LINES)
+    }
+
+    /**
+     * 退回路径：老式的 `chat/completions`。
+     *
+     * 先请求「关掉思考」。实测 deepseek 的推理型号默认会用五千多个思考 token（90 秒）
+     * 才肯出正文，关掉之后 3.5~7 秒就答完，且正文更简明。
+     */
+    private fun askChat(config: AiConfig, question: String): String {
+        val url = config.endpoint("/chat/completions")
+        val text = try {
+            request(url, "POST", config.apiKey, buildChatPayload(config, question, true), CHAT_TIMEOUT_MS)
         } catch (e: AiException) {
             // 不认这个字段的服务商会直接 400/422，此时退回不带它的原始请求
             val msg = e.message.orEmpty()
             if (msg.startsWith("HTTP 400") || msg.startsWith("HTTP 422")) {
                 Log.i(TAG, "服务端不接受 thinking 字段，改用默认请求：$msg")
-                request(url, "POST", config.apiKey, buildPayload(config, question, false), CHAT_TIMEOUT_MS)
+                request(url, "POST", config.apiKey, buildChatPayload(config, question, false), CHAT_TIMEOUT_MS)
             } else {
                 throw e
             }
         }
-        val root = runCatching { JSONObject(text) }.getOrElse {
-            throw AiException("返回的不是 JSON：${text.take(120)}")
-        }
-        root.optJSONObject("error")?.optString("message")?.takeIf { it.isNotBlank() }?.let {
-            throw AiException(it)
-        }
+        val root = jsonOf(text)
+        errorMessageOf(root)?.let { throw AiException(it) }
+        return parseChatRoot(root)
+    }
+
+    /** 解析 chat/completions 的返回体。抽出来是因为 `/responses` 也可能回这种格式。 */
+    private fun parseChatRoot(root: JSONObject): String {
         val choices = root.optJSONArray("choices")
             ?: throw AiException("返回里没有 choices")
         if (choices.length() == 0) throw AiException("模型没有返回内容")
@@ -136,12 +216,28 @@ object AiClient {
     }
 
     /**
-     * 请求体。[disableThinking] 为真时带上 `thinking: {"type":"disabled"}`。
+     * Responses 协议的请求体。
+     *
+     * `instructions` 对应 chat 里的 system 消息，`input` 对应 user 消息；
+     * `store=false` 明说不要把这轮对话留在服务端。
+     */
+    private fun buildResponsesPayload(config: AiConfig, question: String): String =
+        JSONObject().apply {
+            put("model", config.model)
+            put("instructions", SYSTEM_PROMPT)
+            put("input", question.trim())
+            put("temperature", 0)
+            put("max_output_tokens", 2000)
+            put("store", false)
+        }.toString()
+
+    /**
+     * chat/completions 的请求体。[disableThinking] 为真时带上 `thinking: {"type":"disabled"}`。
      *
      * 这是 DeepSeek 系的开关（one-hub 之类的中转站会透传）；别的服务商多半忽略未知字段，
      * 个别严格的会报 400，调用方会去掉该字段重试一次。
      */
-    private fun buildPayload(config: AiConfig, question: String, disableThinking: Boolean): String =
+    private fun buildChatPayload(config: AiConfig, question: String, disableThinking: Boolean): String =
         JSONObject().apply {
             put("model", config.model)
             put("temperature", 0)
@@ -157,6 +253,32 @@ object AiClient {
                 },
             )
         }.toString()
+
+    private fun jsonOf(text: String): JSONObject = runCatching { JSONObject(text) }.getOrElse {
+        throw AiException("返回的不是 JSON：${text.take(120)}")
+    }
+
+    private fun errorMessageOf(root: JSONObject): String? =
+        root.optJSONObject("error")?.optString("message")?.takeIf { it.isNotBlank() }
+
+    /**
+     * Responses 协议下正文为空时，按 `status` / `incomplete_details.reason` / 思考 token 数判断原因。
+     *
+     * 最典型的是推理型号：`status=incomplete` + `reason=max_output_tokens`，
+     * 整个额度都花在 reasoning 项上，message 项里没有 output_text。
+     */
+    private fun describeEmptyResponse(
+        status: String,
+        incomplete: String,
+        reasoningTokens: Int,
+        sawReasoning: Boolean,
+    ): String = when {
+        incomplete == "max_output_tokens" || status == "incomplete" ->
+            "模型没说完就被额度截断了（思考用了 $reasoningTokens token）——换一个非推理模型"
+        sawReasoning || reasoningTokens > 0 ->
+            "模型只回了思考过程，正文是空的——换一个非推理模型"
+        else -> "模型返回了空内容（status=${status.ifBlank { "无" }}），详情见日志"
+    }
 
     /**
      * 模型返回空内容时，尽量说清是哪一种空（界面上只有一行字，详情进日志）。

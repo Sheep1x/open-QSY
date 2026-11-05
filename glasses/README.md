@@ -150,7 +150,17 @@ adb forward tcp:18080 tcp:8080
 | API Key | 只存在眼镜本地（SharedPreferences），不传给任何第三方；留空 = 沿用上次保存的那份 |
 | 模型 | 先点「拉取模型」从 `/models` 拉列表再选；也支持手填 |
 
-接口按 OpenAI 兼容约定：`GET {baseUrl}/models` 拉列表、`POST {baseUrl}/chat/completions` 提问。
+接口按 OpenAI **Responses** 协议：`GET {baseUrl}/models` 拉列表、`POST {baseUrl}/responses` 提问
+（`instructions` 放系统提示、`input` 放题目、`max_output_tokens` 限长、`store=false` 不留存）。
+
+两种自动回退，所以填任何兼容接口都能用：
+
+| 服务端情况 | 客户端行为 |
+|---|---|
+| 有 `/responses` | 走 Responses（默认路径） |
+| 没有（404 / 405 / 501） | 退回 `POST {baseUrl}/chat/completions` |
+| `/responses` 转发到 chat、回 chat 格式 | 按 `choices[0].message.content` 解析 |
+
 随时可以点「关闭 AI（清空配置）」退回纯本地。
 
 ### 什么时候才会调 AI
@@ -165,10 +175,14 @@ adb forward tcp:18080 tcp:8080
 
 ### 推理模型也能用
 
-请求默认带 `"thinking": {"type": "disabled"}` 把思考链关掉。不关的话，实测 `deepseek-v4-pro`
-在「建筑面积」那道题上用了 5230~6573 个思考 token、**90~105 秒**才吐出正文，2000 的 `max_tokens`
-会被思考过程吃光，`content` 返回空、`finish_reason=length`（界面上的报错就是「模型没说完就被
-max_tokens 截断了」）。关掉之后同一道题 **2~7 秒**答完，正文还更简明。
+走 `/responses` 主干时不用做什么：同一个 `deepseek-v4.1-flash`，在 `chat/completions` 下会把
+2000 额度全花在思考上（正文空、`finish_reason=length`），换成 `/responses` 后 3~4 秒就答完，
+思考只有两百来个字符。
+
+退回 `chat/completions` 时会带 `"thinking": {"type": "disabled"}` 把思考链关掉。不关的话，实测
+`deepseek-v4-pro` 在「建筑面积」那道题上用了 5230~6573 个思考 token、**90~105 秒**才吐出正文，
+2000 的 `max_tokens` 会被思考过程吃光（界面上的报错就是「模型没说完就被 max_tokens 截断了」）。
+关掉之后同一道题 **2~7 秒**答完，正文还更简明。
 
 服务商不认这个字段时会返回 400/422，此时自动去掉它重试一次——所以配非 DeepSeek 系的接口
 也能正常工作，只是那种接口本来就大多不是推理型，不关思考也快。
