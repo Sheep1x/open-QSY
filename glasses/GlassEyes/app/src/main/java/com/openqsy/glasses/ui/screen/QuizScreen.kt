@@ -43,6 +43,7 @@ import com.openqsy.glasses.camera.rememberCameraBound
 import com.openqsy.glasses.input.BareKeyEvent
 import com.openqsy.glasses.input.RegisterBareKeyHandler
 import com.openqsy.glasses.quiz.QuizHit
+import com.openqsy.glasses.solve.AiState
 import com.openqsy.glasses.solve.DebugInfo
 import com.openqsy.glasses.solve.QuizUiState
 import com.openqsy.glasses.solve.ScanState
@@ -81,6 +82,7 @@ fun QuizScreen(
     val debug by viewModel.debug.collectAsStateWithLifecycle()
     val scan by viewModel.scan.collectAsStateWithLifecycle()
     val shotSeq by viewModel.shot.collectAsStateWithLifecycle()
+    val aiState by viewModel.ai.collectAsStateWithLifecycle()
 
     // 每真正拍下一张，取景框边闪一下。没有这层反馈时画面看起来是静止的，
     // 用户会以为自己根本没在拍（"不是不停的识别，而是拍一张、过几秒再拍"）。
@@ -359,6 +361,7 @@ fun QuizScreen(
                     paused = paused,
                     onRequestCamera = onRequestCamera,
                     withViewfinder = cameraGranted && !paused,
+                    ai = aiState,
                 )
             }
         }
@@ -451,6 +454,7 @@ private fun MainBody(
     paused: Boolean,
     onRequestCamera: () -> Unit,
     withViewfinder: Boolean = false,
+    ai: AiState = AiState.Off,
 ) {
     when (state) {
         is QuizUiState.LoadingIndex -> BareHeroText(
@@ -491,7 +495,12 @@ private fun MainBody(
             if (hit == null) {
                 Column(modifier = Modifier.fillMaxWidth()) {
                     Text(
-                        text = if (paused) "已暂停" else "对准题目",
+                        text = when (ai) {
+                            is AiState.Done -> "AI 答案"
+                            is AiState.Thinking -> "AI 思考中"
+                            is AiState.Failed -> "AI 没答上来"
+                            AiState.Off -> if (paused) "已暂停" else "对准题目"
+                        },
                         color = NeonGreen,
                         fontSize = 18.sp,
                         lineHeight = 24.sp,
@@ -499,7 +508,12 @@ private fun MainBody(
                         maxLines = 1,
                     )
                     Text(
-                        text = if (paused) "单击继续扫描" else state.hint,
+                        text = when (ai) {
+                            is AiState.Done -> "题库里没有这题 · 由 AI 作答"
+                            is AiState.Thinking -> "题库里没有这题，正在问 ${ai.model}"
+                            is AiState.Failed -> ai.message
+                            AiState.Off -> if (paused) "单击继续扫描" else state.hint
+                        },
                         color = NeonGreen.copy(alpha = 0.75f),
                         fontSize = BareTokens.BodySp,
                         lineHeight = BareTokens.BodyLineH,
@@ -508,7 +522,26 @@ private fun MainBody(
                         modifier = Modifier.padding(top = 2.dp),
                     )
                     // 把 OCR 原文显示出来：出不来答案时，用户一眼能判断是「没识别对」还是「题库没有」
-                    if (state.ocrPreview.isNotBlank()) {
+                    val aiDone = ai as? AiState.Done
+                    if (aiDone != null) {
+                        // 题库没有这题、AI 给了答案：让识别原文让位给答案
+                        Divider()
+                        Text(
+                            text = "${aiDone.model} · ${aiDone.elapsedMs} 毫秒",
+                            color = NeonGreen.copy(alpha = 0.6f),
+                            fontSize = BareTokens.CaptionSp,
+                            lineHeight = BareTokens.CaptionLineH,
+                            maxLines = 1,
+                        )
+                        Text(
+                            text = aiDone.answer,
+                            color = NeonGreen,
+                            fontSize = BareTokens.BodySp,
+                            lineHeight = BareTokens.BodyLineH,
+                            maxLines = if (withViewfinder) 8 else 12,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    } else if (state.ocrPreview.isNotBlank()) {
                         Divider()
                         Text(
                             text = "识别到：",

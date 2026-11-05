@@ -8,6 +8,8 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.openqsy.glasses.ai.AiClient
+import com.openqsy.glasses.ai.AiConfig
 import com.openqsy.glasses.live.LiveFrameAnalyzer
 import com.openqsy.glasses.ocr.MlKitOcrEngine
 import com.openqsy.glasses.ocr.OcrEngine
@@ -51,6 +53,25 @@ sealed interface QuizUiState {
     ) : QuizUiState
 
     data class Failure(val message: String) : QuizUiState
+}
+
+/**
+ * 题库没匹配上时，「问 AI」这一路的状态。
+ *
+ * 只在题库没命中时才出现：题库命中永远走本地答案，不联网、也没有等待。
+ */
+sealed interface AiState {
+    /** 没配置 AI，或这一屏还轮不到 AI。 */
+    data object Off : AiState
+
+    /** 已经把题目发出去了，正在等模型。 */
+    data class Thinking(val model: String) : AiState
+
+    /** 拿到答案。[elapsedMs] 只是让用户心里有数（等了几秒）。 */
+    data class Done(val answer: String, val model: String, val elapsedMs: Long) : AiState
+
+    /** 失败了，[message] 直接展示给用户。 */
+    data class Failed(val message: String) : AiState
 }
 
 /** 调试页信息（长按切换）。 */
@@ -149,6 +170,20 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
     /** 局域网题库上传服务；只在连上 WiFi 时启动。 */
     private var uploadServer: QBankUploadServer? = null
 
+    /** AI 接入配置；三项齐全才可用，否则整条 AI 链路都不启用（保持全程离线）。 */
+    @Volatile private var aiConfig = AiConfig()
+
+    /** 上次真正发起 AI 调用的时刻，用来节流。 */
+    private var lastAiAt = 0L
+
+    /** 上次问过的正文（去空白形式）：同一张卷子反复拍到同一段文字时不重复烧 token。 */
+    private var lastAiQuestion = ""
+
+    private val _ai = MutableStateFlow<AiState>(AiState.Off)
+
+    /** 题库没匹配上时 AI 这一路的状态，界面直接订阅。 */
+    val ai: StateFlow<AiState> = _ai.asStateFlow()
+
     /** 当前题库的名字与体积，供手机上传页展示。 */
     @Volatile
     private var currentTitle = ""
@@ -228,6 +263,8 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
     private var selfCheckText = "-"
 
     init {
+        aiConfig = AiConfig.load(getApplication())
+        Log.i(TAG, "AI 配置：${aiConfig.describe()}")
         viewModelScope.launch(Dispatchers.IO) { loadIndex() }
     }
 
@@ -316,16 +353,13 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
     /**
      * 启动局域网题库上传服务。
      *
-     * 只有连上 WiFi 才有意义，所以拿不到局域网 IP 时直接跳过，不打扰用户。
+     * 服务绑的是 0.0.0.0，本来就不依赖有没有局域网 IP，所以拿不到 IP 也照样启动：
+     * 没 WiFi 时用 USB 转发（`adb forward tcp:18080 tcp:8080`）也能在电脑上打开配置页。
      * 服务只监听内网，不访问公网；应用退出时在 [onCleared] 里关闭。
      */
     fun startUploadServer() {
         if (uploadServer?.isRunning == true) return
         val ip = QBankUploadServer.localIpv4()
-        if (ip == null) {
-            _debug.update { it.copy(uploadUrl = "未连 WiFi") }
-            return
-        }
         val server = QBankUploadServer(
             statusProvider = { uploadStatusJson() },
             onUpload = { fileName, bytes ->
@@ -340,11 +374,18 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
                     QBankUploadServer.UploadOutcome.Err(t.message ?: "题库处理失败")
                 }
             },
+            aiConfigProvider = { aiConfig },
+            onAiConfigSave = { cfg ->
+                AiConfig.save(getApplication(), cfg)
+                viewModelScope.launch(Dispatchers.Main) { reloadAiConfig() }
+            },
         )
         runCatching { server.start() }
             .onSuccess {
                 uploadServer = server
-                _debug.update { it.copy(uploadUrl = server.url()) }
+                _debug.update {
+                    it.copy(uploadUrl = if (ip != null) server.url() else "USB 127.0.0.1:8080")
+                }
             }
             .onFailure { t ->
                 Log.w(TAG, "上传服务启动失败", t)
@@ -459,10 +500,14 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
         val best = confident.firstOrNull()
 
         if (best == null) {
-            // 没到阈值：这张照片没认出题库里的题
+            // 没到阈值：这张照片没认出题库里的题 —— 这正是 AI 唯一该出场的时候
             emitLive(hint = "题库里没找到 · 识别 ${lastOcrChars} 字")
+            maybeAskAi(ocr.text)
             return
         }
+
+        // 题库命中了：AI 那一路就没意义了，把上一条 AI 结果收走，免得界面还挂着旧答案
+        if (_ai.value != AiState.Off) _ai.value = AiState.Off
 
         // 4.5) 条件硬校验：题干里的数字、否定词跟题库原题对不上，多半是「同一考点但改了条件」。
         // 这时把原题的答案端上去一定是错的，而且用户看不出来——宁可不给。
@@ -478,6 +523,8 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
             voteWindow.clear()
             locked = false
             emitLive(hint = "题干与题库不符（$conflict）· 不给答案")
+            // 题库答不了这道题（题被改过），正好交给 AI
+            maybeAskAi(ocr.text)
             return
         }
 
@@ -624,6 +671,55 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
         }.filter { it.isNotEmpty() }.toSet()
 
     private fun negationTokens(text: String): Set<String> = NEGATION.findAll(text).map { it.value }.toSet()
+
+    // ------------------------------------------------------------------ AI
+
+    /**
+     * 题库没答案时才走这里。
+     *
+     * 三道闸门，都是为了让眼镜别每 3 秒就往模型上打一枪：
+     * - 没配好 AI → 直接返回（等于全程离线）；
+     * - 距上次调用不到 [AI_MIN_INTERVAL_MS] → 跳过；
+     * - 认到的文字和上次问过的完全一样 → 跳过（举着不动就别重复烧 token）。
+     */
+    private fun maybeAskAi(text: String) {
+        val cfg = aiConfig
+        if (!cfg.enabled) return
+        if (text.count { !it.isWhitespace() } < MIN_AI_QUESTION_CHARS) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastAiAt < AI_MIN_INTERVAL_MS) return
+        val norm = text.filter { !it.isWhitespace() }
+        if (norm == lastAiQuestion) return
+        lastAiAt = now
+        lastAiQuestion = norm
+        askAi(text)
+    }
+
+    private fun askAi(text: String) {
+        val cfg = aiConfig
+        _ai.value = AiState.Thinking(cfg.model)
+        viewModelScope.launch {
+            val t0 = SystemClock.elapsedRealtime()
+            val result = withContext(Dispatchers.IO) { runCatching { AiClient.ask(cfg, text) } }
+            val ms = SystemClock.elapsedRealtime() - t0
+            result.onSuccess { answer ->
+                Log.i(TAG, "AI 作答 ${answer.length}字/${ms}ms：${answer.take(60).replace('\n', ' ')}")
+                _ai.value = AiState.Done(answer, cfg.model, ms)
+            }.onFailure { e ->
+                Log.w(TAG, "AI 调用失败", e)
+                _ai.value = AiState.Failed(e.message ?: e.javaClass.simpleName)
+            }
+        }
+    }
+
+    /** AI 配置在手机上保存之后调一次，让新配置立刻生效（不用重启应用）。 */
+    fun reloadAiConfig() {
+        aiConfig = AiConfig.load(getApplication())
+        lastAiAt = 0L
+        lastAiQuestion = ""
+        _ai.value = AiState.Off
+        Log.i(TAG, "AI 配置已刷新：${aiConfig.describe()}")
+    }
 
     private fun emitLive(hint: String) {
         val shown = candidates.getOrNull(currentCandidate)
@@ -792,6 +888,7 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
                     lastOcrMs = ocr.elapsedMs
                     lastOcrPreview = ocr.text.take(400)
                     emitLive(hint = "题干与题库不符（$conflict）· 不给答案")
+                    maybeAskAi(ocr.text)
                     return@launch
                 }
                 candidates = hits
@@ -800,7 +897,10 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
                 lastOcrChars = ocr.text.length
                 lastOcrMs = ocr.elapsedMs
                 lastOcrPreview = ocr.text.take(400)
-                emitLive(hint = if (hits.isEmpty()) "题库里没找到 · 识别 ${ocr.text.length} 字" else "")
+                val found = best != null && best.score >= MIN_SCORE
+                emitLive(hint = if (!found) "题库里没找到 · 识别 ${ocr.text.length} 字" else "")
+                // 与相机那条路同一条规则：题库没答案才问 AI
+                if (!found) maybeAskAi(ocr.text)
                 val nowHit = (_state.value as? QuizUiState.Live)?.hit
                 Log.i(TAG, "ocrimg emit: cands=${candidates.size} hitDoc=${nowHit?.docId} hitScore=${nowHit?.score}")
             }
@@ -1017,5 +1117,11 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
 
         /** 下载到的文件小于这个体积就不当题库（防止把错误页/图标当天题库）。 */
         const val MIN_BANK_BYTES = 8 * 1024L
+
+        /** 两次 AI 调用之间至少隔这么久——一拍 3 秒，不节流就变成每 3 秒一次请求。 */
+        const val AI_MIN_INTERVAL_MS = 15_000L
+
+        /** 认到的正文短于这个字数就不值得问模型（多半是只拍到了半行）。 */
+        const val MIN_AI_QUESTION_CHARS = 8
     }
 }

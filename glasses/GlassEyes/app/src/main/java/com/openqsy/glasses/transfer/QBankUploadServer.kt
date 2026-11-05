@@ -1,6 +1,9 @@
 package com.openqsy.glasses.transfer
 
 import android.util.Log
+import com.openqsy.glasses.ai.AiClient
+import com.openqsy.glasses.ai.AiConfig
+import org.json.JSONObject
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
@@ -23,14 +26,21 @@ import java.util.concurrent.atomic.AtomicBoolean
  * 只监听局域网，不连公网；服务只在用户主动打开上传模式时启动，退出即关闭。
  *
  * 协议：
- * - `GET  /`        上传页（HTML）
- * - `GET  /status`  当前题库信息（JSON，页面轮询用）
- * - `POST /upload`  multipart/form-data，字段名 `file`
+ * - `GET  /`          上传页（HTML）
+ * - `GET  /status`    当前题库信息（JSON，页面轮询用）
+ * - `POST /upload`    multipart/form-data，字段名 `file`
+ * - `GET  /ai`        AI 配置页（HTML；眼镜没有键盘，第三方 API 的 baseUrl/Key 在这里填）
+ * - `GET  /ai/status` 当前 AI 配置（脱敏）
+ * - `POST /ai/models` `{"baseUrl","apiKey"}` → 拉取可用模型列表
+ * - `POST /ai/save`   `{"baseUrl","apiKey","model"}` → 保存配置
+ * - `POST /ai/clear`  清空配置，回到纯本地（题库没答案时就只显示「没找到」）
  */
 class QBankUploadServer(
     private val port: Int = DEFAULT_PORT,
     private val statusProvider: () -> String,
     private val onUpload: (fileName: String, bytes: ByteArray) -> UploadOutcome,
+    private val aiConfigProvider: () -> AiConfig = { AiConfig() },
+    private val onAiConfigSave: (AiConfig) -> Unit = {},
 ) {
 
     sealed interface UploadOutcome {
@@ -146,6 +156,132 @@ class QBankUploadServer(
 
                             is UploadOutcome.Err -> respondJson(output, 200, err(outcome.message))
                         }
+                    }
+
+                    method == "GET" && path == "/ai" ->
+                        respond(output, 200, "text/html; charset=utf-8", AI_HTML)
+
+                    method == "GET" && path == "/ai/status" -> {
+                        val cfg = aiConfigProvider()
+                        respondJson(
+                            output, 200,
+                            """{"ok":true,"configured":${cfg.enabled},"baseUrl":${quote(cfg.baseUrl)},""" +
+                                """"model":${quote(cfg.model)},"hasKey":${cfg.apiKey.isNotBlank()},""" +
+                                """"online":${localIpv4() != null}}""",
+                        )
+                    }
+
+                    method == "POST" && path == "/ai/models" -> {
+                        val length = headers["content-length"]?.toLongOrNull() ?: 0L
+                        if (length <= 0L || length > MAX_JSON_BODY_BYTES) {
+                            respondJson(output, 400, err("请求体为空或太大"))
+                            return@use
+                        }
+                        val json = runCatching { JSONObject(String(readExactly(input, length.toInt()), Charsets.UTF_8)) }
+                            .getOrNull()
+                        if (json == null) {
+                            respondJson(output, 400, err("请求体不是 JSON"))
+                            return@use
+                        }
+                        val baseUrl = json.optString("baseUrl").trim()
+                        // Key 留空 = 沿用已存的那份，省得每次都重新粘一遍
+                        val apiKey = json.optString("apiKey").trim().ifEmpty { aiConfigProvider().apiKey }
+                        runCatching { AiClient.listModels(baseUrl, apiKey) }
+                            .onSuccess { models ->
+                                val arr = models.joinToString(",") { quote(it) }
+                                respondJson(output, 200, """{"ok":true,"models":[$arr]}""")
+                            }
+                            .onFailure { e ->
+                                respondJson(output, 200, err(e.message ?: "拉取模型失败"))
+                            }
+                    }
+
+                    method == "POST" && path == "/ai/save" -> {
+                        val length = headers["content-length"]?.toLongOrNull() ?: 0L
+                        if (length <= 0L || length > MAX_JSON_BODY_BYTES) {
+                            respondJson(output, 400, err("请求体为空或太大"))
+                            return@use
+                        }
+                        val json = runCatching { JSONObject(String(readExactly(input, length.toInt()), Charsets.UTF_8)) }
+                            .getOrNull()
+                        if (json == null) {
+                            respondJson(output, 400, err("请求体不是 JSON"))
+                            return@use
+                        }
+                        // 页面上 Key 留空表示「不修改」，沿用已存的那一份
+                        val savedKey = aiConfigProvider().apiKey
+                        val inputKey = json.optString("apiKey").trim()
+                        val cfg = AiConfig(
+                            baseUrl = json.optString("baseUrl").trim(),
+                            apiKey = inputKey.ifEmpty { savedKey },
+                            model = json.optString("model").trim(),
+                        )
+                        if (!cfg.enabled) {
+                            respondJson(output, 200, err("baseUrl、API Key、模型 三项都要填"))
+                            return@use
+                        }
+                        runCatching { onAiConfigSave(cfg) }
+                            .onFailure {
+                                Log.w(TAG, "保存 AI 配置失败", it)
+                                respondJson(output, 200, err("保存失败：${it.message ?: "未知原因"}"))
+                            }
+                            .onSuccess {
+                                Log.i(TAG, "AI 配置已保存：${cfg.describe()}")
+                                respondJson(
+                                    output, 200,
+                                    """{"ok":true,"message":"已保存","detail":${quote(cfg.describe())}}""",
+                                )
+                            }
+                    }
+
+                    method == "POST" && path == "/ai/clear" -> {
+                        runCatching { onAiConfigSave(AiConfig()) }
+                            .onFailure {
+                                Log.w(TAG, "清空 AI 配置失败", it)
+                                respondJson(output, 200, err("清空失败：${it.message ?: "未知原因"}"))
+                            }
+                            .onSuccess {
+                                Log.i(TAG, "AI 配置已清空（回到纯本地）")
+                                respondJson(output, 200, """{"ok":true,"message":"已关闭 AI，识别回到纯本地"}""")
+                            }
+                    }
+
+                    method == "POST" && path == "/ai/test" -> {
+                        val length = headers["content-length"]?.toLongOrNull() ?: 0L
+                        if (length <= 0L || length > MAX_JSON_BODY_BYTES) {
+                            respondJson(output, 400, err("请求体为空或太大"))
+                            return@use
+                        }
+                        val json = runCatching { JSONObject(String(readExactly(input, length.toInt()), Charsets.UTF_8)) }
+                            .getOrNull()
+                        if (json == null) {
+                            respondJson(output, 400, err("请求体不是 JSON"))
+                            return@use
+                        }
+                        val cfg = aiConfigProvider()
+                        if (!cfg.enabled) {
+                            respondJson(output, 200, err("还没配置 AI"))
+                            return@use
+                        }
+                        val question = json.optString("question").trim().ifBlank { DEFAULT_AI_TEST_QUESTION }
+                        val t0 = System.currentTimeMillis()
+                        runCatching { AiClient.ask(cfg, question) }
+                            .onSuccess { answer ->
+                                val ms = System.currentTimeMillis() - t0
+                                Log.i(TAG, "AI 自测成功 ${answer.length}字/${ms}ms")
+                                respondJson(
+                                    output, 200,
+                                    """{"ok":true,"model":${quote(cfg.model)},"ms":$ms,"answer":${quote(answer)}}""",
+                                )
+                            }
+                            .onFailure { e ->
+                                val ms = System.currentTimeMillis() - t0
+                                Log.w(TAG, "AI 自测失败：${e.message}")
+                                respondJson(
+                                    output, 200,
+                                    """{"ok":false,"model":${quote(cfg.model)},"ms":$ms,"message":${quote(e.message ?: "未知原因")}}""",
+                                )
+                            }
                     }
 
                     else -> respond(output, 404, "text/plain; charset=utf-8", "not found")
@@ -329,7 +465,16 @@ class QBankUploadServer(
         const val DEFAULT_PORT = 8080
         private const val SOCKET_TIMEOUT_MS = 30_000
         private const val MAX_HEAD_BYTES = 16 * 1024
-        private const val MAX_UPLOAD_BYTES = 32L * 1024 * 1024
+
+        /** 与 [com.openqsy.glasses.quiz.BankDownloader] 的上限保持一致：题库 json 最大 64 MB。 */
+        private const val MAX_UPLOAD_BYTES = 64L * 1024 * 1024
+
+        /** 给 `ai` 这几条接口用：请求体只是几个短字段，给多了没意义。 */
+        private const val MAX_JSON_BODY_BYTES = 64L * 1024
+
+        /** `/ai/test` 不带题目时用这一道：通道通不通、模型能不能答，一眼能看出来。 */
+        private const val DEFAULT_AI_TEST_QUESTION = "建筑业是物质生产部门，属于第（　）产业。\n" +
+            "A. 第一产业\nB. 第二产业\nC. 第三产业\nD. 以上都不是"
         private const val CRLF = "\r\n"
         private const val CRLFCRLF = 0x0D0A0D0A
         private val CRLFCRLF_BYTES = byteArrayOf(13, 10, 13, 10)
@@ -498,6 +643,157 @@ function loadStatus() {
 
 loadStatus();
 setInterval(loadStatus, 5000);
+</script>
+</body>
+</html>
+"""
+
+    /**
+     * AI 配置页。
+     *
+     * 眼镜没有键盘，几十位的 API Key 不可能在眼镜上敲，所以配置一律走手机/电脑浏览器：
+     * 眼镜起这个 HTTP 服务，手机连同一个 WiFi 打开 `http://<眼镜IP>:8080/ai` 填表即可。
+     */
+    private val AI_HTML: String = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI 设置</title>
+<style>
+ body{font-family:system-ui,-apple-system,"Microsoft YaHei",sans-serif;margin:0;padding:20px;background:#0f1216;color:#e6edf3}
+ h1{font-size:18px;margin:0 0 8px}
+ p.note{font-size:13px;line-height:1.7;color:#8b949e;margin:0 0 6px}
+ code{background:#161b22;padding:1px 4px;border-radius:4px;font-size:12px}
+ label{display:block;font-size:13px;margin:16px 0 6px;color:#c9d1d9}
+ input,select{width:100%;box-sizing:border-box;padding:10px;font-size:14px;border-radius:8px;border:1px solid #30363d;background:#161b22;color:#e6edf3}
+ input:focus,select:focus{outline:none;border-color:#238636}
+ .row{display:flex;gap:10px;margin-top:20px}
+ button{flex:1;padding:12px;font-size:15px;border-radius:8px;border:0;background:#238636;color:#fff}
+ button.ghost{background:#21262d;border:1px solid #30363d}
+ button:disabled{opacity:.45}
+ #msg{margin-top:16px;font-size:14px;line-height:1.6;min-height:22px}
+ .ok{color:#3fb950}.err{color:#f85149}.dim{color:#8b949e}
+</style>
+</head>
+<body>
+<h1>AI 设置</h1>
+<p class="note">只在题库里<strong>没找到</strong>这道题时才调用；题库命中时一律走本地答案——不联网、更快、更准。</p>
+<p class="note">要求兼容 OpenAI 接口：<code>GET {baseUrl}/models</code>、<code>POST {baseUrl}/chat/completions</code>。</p>
+<p class="note">三项都空着 = 完全离线，和以前一样。</p>
+
+<label for="base">baseUrl</label>
+<input id="base" placeholder="https://api.example.com/v1" autocomplete="off" spellcheck="false">
+
+<label for="key">API Key</label>
+<input id="key" type="password" placeholder="sk-..." autocomplete="off" spellcheck="false">
+
+<label for="model">模型</label>
+<select id="model"><option value="">— 先点「拉取模型」 —</option></select>
+<input id="modelText" placeholder="也可以直接手填模型名" autocomplete="off" spellcheck="false" style="margin-top:8px">
+
+<div class="row">
+ <button class="ghost" id="pull">拉取模型</button>
+ <button id="save">保存</button>
+</div>
+<div class="row" style="margin-top:10px">
+ <button class="ghost" id="test">测一次（示例题）</button>
+ <button class="ghost" id="clear">关闭 AI（清空配置）</button>
+</div>
+<div id="msg" class="dim"></div>
+
+<script>
+var q = function (id) { return document.getElementById(id); };
+function say(t, c) { var m = q('msg'); m.className = c || 'dim'; m.textContent = t; }
+
+function fillModels(models, current) {
+  var sel = q('model');
+  sel.innerHTML = '';
+  var ph = document.createElement('option');
+  ph.value = ''; ph.textContent = '— 选择模型 —';
+  sel.appendChild(ph);
+  models.forEach(function (m) {
+    var o = document.createElement('option');
+    o.value = m; o.textContent = m;
+    if (m === current) o.selected = true;
+    sel.appendChild(o);
+  });
+}
+
+function loadStatus() {
+  fetch('/ai/status').then(function (r) { return r.json(); }).then(function (r) {
+    if (r.baseUrl) q('base').value = r.baseUrl;
+    if (r.hasKey) q('key').placeholder = '已保存（留空 = 不修改）';
+    if (r.model) { fillModels([r.model], r.model); q('modelText').value = r.model; }
+    if (!r.online) {
+      say('⚠ 眼镜当前没有联网（WiFi 未连）：拉模型和问 AI 都会失败，先让眼镜连上 WiFi', 'err');
+    } else {
+      say(r.configured ? '当前生效：' + r.model + ' @ ' + r.baseUrl : '当前未配置 AI（完全离线）');
+    }
+  }).catch(function (e) { say('读取状态失败：' + e, 'err'); });
+}
+
+q('pull').onclick = function () {
+  var baseUrl = q('base').value.trim(), apiKey = q('key').value.trim();
+  if (!baseUrl) { say('请先填 baseUrl', 'err'); return; }
+  q('pull').disabled = true;
+  say('正在拉取模型…');
+  fetch('/ai/models', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({baseUrl: baseUrl, apiKey: apiKey})
+  }).then(function (r) { return r.json(); }).then(function (r) {
+    if (!r.ok) { say(r.message || '拉取失败', 'err'); return; }
+    fillModels(r.models, q('modelText').value);
+    say('拿到 ' + r.models.length + ' 个模型，选一个再保存', 'ok');
+  }).catch(function (e) { say('拉取失败：' + e, 'err'); })
+    .finally(function () { q('pull').disabled = false; });
+};
+
+q('save').onclick = function () {
+  var baseUrl = q('base').value.trim();
+  var apiKey = q('key').value.trim();
+  var model = (q('model').value || q('modelText').value).trim();
+  if (!baseUrl || !model) { say('baseUrl 和模型都要填', 'err'); return; }
+  q('save').disabled = true;
+  fetch('/ai/save', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({baseUrl: baseUrl, apiKey: apiKey, model: model})
+  }).then(function (r) { return r.json(); }).then(function (r) {
+    if (!r.ok) { say(r.message || '保存失败', 'err'); return; }
+    say('已保存：' + r.detail, 'ok');
+    q('modelText').value = model;
+  }).catch(function (e) { say('保存失败：' + e, 'err'); })
+    .finally(function () { q('save').disabled = false; });
+};
+
+q('test').onclick = function () {
+  q('test').disabled = true;
+  say('正在问模型，可能要十几秒…');
+  fetch('/ai/test', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'})
+    .then(function (r) { return r.json(); }).then(function (r) {
+      if (!r.ok) { say('失败：' + r.message, 'err'); return; }
+      say('成功（' + r.model + ' · ' + r.ms + 'ms）\n' + r.answer, 'ok');
+    }).catch(function (e) { say('请求失败：' + e, 'err'); })
+    .finally(function () { q('test').disabled = false; });
+};
+
+q('clear').onclick = function () {
+  if (!confirm('清空后，题库里没答案时就只显示「没找到」，不再调用 AI。确定？')) return;
+  q('clear').disabled = true;
+  fetch('/ai/clear', {method: 'POST'})
+    .then(function (r) { return r.json(); }).then(function (r) {
+      if (!r.ok) { say(r.message || '清空失败', 'err'); return; }
+      q('base').value = ''; q('key').value = ''; q('modelText').value = '';
+      q('key').placeholder = 'sk-...';
+      fillModels([], '');
+      say(r.message, 'ok');
+    }).catch(function (e) { say('清空失败：' + e, 'err'); })
+    .finally(function () { q('clear').disabled = false; });
+};
+
+q('model').onchange = function () { if (q('model').value) q('modelText').value = q('model').value; };
+loadStatus();
 </script>
 </body>
 </html>
