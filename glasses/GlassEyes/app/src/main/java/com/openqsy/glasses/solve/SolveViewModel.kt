@@ -1,6 +1,7 @@
 package com.openqsy.glasses.solve
 
 import android.app.Application
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.SystemClock
 import android.util.Log
@@ -13,6 +14,7 @@ import com.openqsy.glasses.ai.AiConfig
 import com.openqsy.glasses.live.LiveFrameAnalyzer
 import com.openqsy.glasses.ocr.MlKitOcrEngine
 import com.openqsy.glasses.ocr.OcrEngine
+import com.openqsy.glasses.ocr.OcrLine
 import com.openqsy.glasses.ocr.OcrOutcome
 import com.openqsy.glasses.quiz.BankDownloader
 import com.openqsy.glasses.quiz.QBankLoader
@@ -225,11 +227,11 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
     /**
      * 取景框宽高比（宽/高），由界面实测上报。
      *
-     * 0 表示还没量到——那时按整帧识别。量到之后只认「框里能看到的那块」，
-     * 屏幕上看到的和实际识别的就是同一块画面。
+     * 初值取取景框的默认比例：界面只在「还没出答案」时上报尺寸，demo / AI 这种
+     * 一上来就有答案的场景不会上报，按 0 处理的话缩略图会是全黑的。
      */
     @Volatile
-    private var viewfinderAspect = 0f
+    private var viewfinderAspect = DEFAULT_BOX_ASPECT
 
     /**
      * 快门计数：每真正拍下一张 +1。
@@ -239,6 +241,22 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
      */
     private val _shot = MutableStateFlow(0)
     val shot: StateFlow<Int> = _shot.asStateFlow()
+
+    /**
+     * 最近一次真正送去识别的那块画面（灰度、已按取景框裁好）。
+     *
+     * 用它替代实时预览：用户要的是「知道这一张认的是哪个题」，不是看视频；而这张图就是识别输入
+     * 本身，比预览更准。也省掉相机的第二路出流——实测单核占用 52.9% → 23.5%。
+     * **只存在内存里，不写文件。**
+     */
+    private val _frame = MutableStateFlow<Bitmap?>(null)
+    val frame: StateFlow<Bitmap?> = _frame.asStateFlow()
+
+    /** 上一张预览缩略图的时间（缩略图与识别节拍无关，刷新快得多）。 */
+    private var lastThumbAt = 0L
+
+    /** AI 是否正在回答一道题。处理期间不拍照；回来后重新起算 3 秒。 */
+    @Volatile private var aiBusy = false
 
     /** 两次拍摄之间丢掉了多少帧，只给调试页看。 */
     private var throttledSkips = 0
@@ -451,6 +469,22 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
 
         val now = SystemClock.elapsedRealtime()
 
+        // 预览缩略图：跟识别节拍无关，每 [THUMB_INTERVAL_MS] 换一张，让用户看得见相机对着什么。
+        // 直接读 Y 平面抽样，不另开相机流——这也是「不用 Preview 也能流畅预览」的关键。
+        if (now - lastThumbAt >= THUMB_INTERVAL_MS) {
+            lastThumbAt = now
+            runCatching { engine.thumbnail(image, viewfinderAspect) }
+                .getOrNull()?.let { _frame.value = it }
+        }
+
+        // AI 正在回答上一道题：这一轮不拍。等它回来再重新起算 3 秒，
+        // 否则 AI 还在跑、下一张又盖上来，用户看到的结论会来回跳。
+        if (aiBusy) {
+            throttledSkips++
+            image.close()
+            return
+        }
+
         // 固定节奏：每 [SHOT_INTERVAL_MS] 拍一张。中间到的帧直接丢弃。
         // 这样用户看到的是「拍一张 → 出结果 → 定格几秒 → 再拍一张」，
         // 而不是画面不停地跳、答案一直在变。
@@ -473,6 +507,8 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
         }
         lastOcrMs = ocr.elapsedMs
         lastOcrChars = ocr.text.length
+        // 界面上的画面由 thumbnail() 每 THUMB_INTERVAL_MS 刷一次（见 handleFrame 开头），
+        // 这里不再覆盖：否则每 3 秒跳一张更清晰的大图、再跳回缩略图，看着是闪的。
         // 把认到的原文打出来：屏幕上只显示前 160 字，日志里留全文方便比对"认错了什么"。
         Log.d(
             TAG,
@@ -561,6 +597,34 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val sorted = lines.sortedBy { it.centerY }
+
+        // 顶部优先：先把识别结果按「题号行」切成一道一道的题，然后从上往下试，
+        // 第一道能认出来的就是答案——位置本身就是最强的线索。
+        // 实测一屏三题（y=0.26 / 0.44 / 0.61）：按分数会选中中间那道（0.978），
+        // 按位置才选得对顶部那道（0.736）。用户要的就是顶部。
+        var topScore = 0f
+        var topHits: List<QuizHit> = emptyList()
+        var topText = ""
+        val blocks = splitIntoBlocks(sorted)
+        for (b in blocks.take(MAX_TOP_BLOCKS)) {
+            val text = b.joinToString("\n") { it.text }
+            if (text.length < MIN_WINDOW_CHARS) continue
+            val hits = store.search(text, topK = SEARCH_TOPK)
+            val s = hits.firstOrNull()?.score ?: 0f
+            if (s > topScore) {
+                topScore = s
+                topHits = hits
+                topText = text
+            }
+            if (s >= MIN_SCORE) break
+        }
+        // 顶部这几道里已经有一道认出来了：直接给它，不再算中心窗口。
+        if (topScore >= MIN_SCORE) {
+            Log.d(TAG, "top: lines=${lines.size} blocks=${blocks.size} score=%.3f".format(topScore))
+            lastMatchText = topText
+            return topHits
+        }
+
         val centerIdx = sorted.indices.minByOrNull { abs(sorted[it].centerY - 0.5f) } ?: 0
 
         // 「由近及远」的行序：中心那行、下一行、上一行、下二行、上二行……
@@ -598,17 +662,38 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
         val fallbackScore = fallback.firstOrNull()?.score ?: 0f
         // 注意：整串要先拼好再 format。写成 "a=%.2f " + "b=%.3f".format(...) 的话，
         // 因为 . 的优先级高于 +，只有后半段会被替换，前半段会原样打出 "%.2f"。
-        val msg = "center: lines=${lines.size} centerY=%.2f win=${bestLines}行 " +
+        val msg = "center: lines=${lines.size} centerY=%.2f win=${bestLines}行 top=%.3f " +
             "score=%.3f full=%.3f"
         Log.d(
             TAG,
-            msg.format(sorted[centerIdx].centerY, bestScore, fallbackScore),
+            msg.format(sorted[centerIdx].centerY, topScore, bestScore, fallbackScore),
         )
 
         // 窗口没把握时用整段；整段也没更好就还是窗口（窗口至少更"聚焦"）。
+        // 顶部这几道都没认出来，才退回到「以中心为锚」和「整段」。
         val useFallback = bestScore <= 0f || fallbackScore > bestScore + 0.05f
         lastMatchText = if (useFallback) ocr.text else bestText
         return if (useFallback) fallback else bestHits
+    }
+
+    /**
+     * 把识别出来的行按「题号行」切成一道一道的题，保持从上到下的顺序。
+     *
+     * 题号行的样子是 `1.` `2、` `3．`——行首一两个数字加顿号/点。
+     * 切不出来（比如认到的只有半句题干）就返回空列表，调用方会退回滑窗那套。
+     */
+    private fun splitIntoBlocks(lines: List<OcrLine>): List<List<OcrLine>> {
+        val blocks = ArrayList<MutableList<OcrLine>>()
+        var cur: MutableList<OcrLine>? = null
+        for (l in lines) {
+            if (Q_START.containsMatchIn(l.text)) {
+                val nb = ArrayList<OcrLine>()
+                blocks.add(nb)
+                cur = nb
+            }
+            cur?.add(l)
+        }
+        return blocks
     }
 
     /**
@@ -685,6 +770,7 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
     private fun maybeAskAi(text: String) {
         val cfg = aiConfig
         if (!cfg.enabled) return
+        if (aiBusy) return
         if (text.count { !it.isWhitespace() } < MIN_AI_QUESTION_CHARS) return
         val now = SystemClock.elapsedRealtime()
         if (now - lastAiAt < AI_MIN_INTERVAL_MS) return
@@ -698,16 +784,24 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
     private fun askAi(text: String) {
         val cfg = aiConfig
         _ai.value = AiState.Thinking(cfg.model)
+        aiBusy = true
         viewModelScope.launch {
-            val t0 = SystemClock.elapsedRealtime()
-            val result = withContext(Dispatchers.IO) { runCatching { AiClient.ask(cfg, text) } }
-            val ms = SystemClock.elapsedRealtime() - t0
-            result.onSuccess { answer ->
-                Log.i(TAG, "AI 作答 ${answer.length}字/${ms}ms：${answer.take(60).replace('\n', ' ')}")
-                _ai.value = AiState.Done(answer, cfg.model, ms)
-            }.onFailure { e ->
-                Log.w(TAG, "AI 调用失败", e)
-                _ai.value = AiState.Failed(e.message ?: e.javaClass.simpleName)
+            try {
+                val t0 = SystemClock.elapsedRealtime()
+                val result = withContext(Dispatchers.IO) { runCatching { AiClient.ask(cfg, text) } }
+                val ms = SystemClock.elapsedRealtime() - t0
+                result.onSuccess { answer ->
+                    Log.i(TAG, "AI 作答 ${answer.length}字/${ms}ms：${answer.take(60).replace('\n', ' ')}")
+                    _ai.value = AiState.Done(answer, cfg.model, ms)
+                }.onFailure { e ->
+                    Log.w(TAG, "AI 调用失败", e)
+                    _ai.value = AiState.Failed(e.message ?: e.javaClass.simpleName)
+                }
+            } finally {
+                // 等 AI 答完才重新起算拍摄节拍：否则刚出答案镜头一动又拍一张，
+                // 界面在「AI 结论」和「下一道题」之间来回跳。用户要求的就是这个节奏。
+                lastShotAt = SystemClock.elapsedRealtime()
+                aiBusy = false
             }
         }
     }
@@ -846,9 +940,9 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
                 bmp.recycle()
                 return@launch
             }
-            // 离屏验收时默认认整帧：取景框比例来自界面实测，没界面时按 0 处理就是不裁。
-            // 要复现相机那条裁剪路径，先用相机跑一次让 viewfinderAspect 有值即可。
-            val aspect = viewfinderAspect
+            // 离屏验收一律认整帧：这里不吃 viewfinderAspect，否则界面上报过的
+            // 框比例（440×140）会把 768×1024 的测试图裁成中间一条。
+            val aspect = 0f
             val ocr = ml.recognizeBitmap(bmp, aspect)
             bmp.recycle()
             Log.i(
@@ -1076,7 +1170,7 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
         const val MIN_WINDOW_CHARS = 12
 
         /** 取景框的宽高比（480 / 220）；界面还没量出真实尺寸时用它兜底。 */
-        const val DEFAULT_BOX_ASPECT = 480f / 220f
+        const val DEFAULT_BOX_ASPECT = 480f / 140f
 
         /** 低于此分值视为「没扫到」，不刷新答案（防乱跳）。 */
         const val MIN_SCORE = 0.55f
@@ -1104,6 +1198,15 @@ class SolveViewModel(application: Application) : AndroidViewModel(application) {
          * 早先做过「画面变了就 350ms 拍一次」的连续识别，实际用起来是屏幕一直在跳、
          * 用户看不清也定不住。改成固定节拍后，一张照片对应一次结果，中间是静止的。
          */
+        /** 预览缩略图的刷新间隔：5 fps 够表达「镜头对着哪」了，再快 Compose 那侧就白烧电。 */
+        const val THUMB_INTERVAL_MS = 200L
+
+        /** 题号行：行首一两位数字 + 顿号/点。用来把一屏多题切成一道一道。 */
+        val Q_START = Regex("^\\s*\\d{1,2}\\s*[.、．]")
+
+        /** 顶部优先时最多往下试几道题——一屏也就两三道，再多就没意义了。 */
+        const val MAX_TOP_BLOCKS = 3
+
         const val SHOT_INTERVAL_MS = 3_000L
 
         /** 防抖：最近 N 次命中里同一题出现 M 次才锁定。 */

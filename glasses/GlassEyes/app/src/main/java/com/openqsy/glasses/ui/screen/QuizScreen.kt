@@ -9,6 +9,8 @@ import androidx.camera.core.UseCase
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.view.PreviewView
+import android.graphics.Bitmap
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.border
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Box
@@ -30,6 +32,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -83,7 +87,14 @@ fun QuizScreen(
     val debug by viewModel.debug.collectAsStateWithLifecycle()
     val scan by viewModel.scan.collectAsStateWithLifecycle()
     val shotSeq by viewModel.shot.collectAsStateWithLifecycle()
+    // 最近一次「真正送去识别的那块画面」，用来替代实时预览
+    val frameShot by viewModel.frame.collectAsStateWithLifecycle()
     val aiState by viewModel.ai.collectAsStateWithLifecycle()
+
+    // 长答案翻页：页数由 MainBody 按实际字号算完回报，这里只记当前第几页。
+    // 答案一换（换题 / AI 出结果）就回到第 1 页。
+    var answerPage by remember { mutableStateOf(0) }
+    var answerPageCount by remember { mutableStateOf(1) }
 
     // 每真正拍下一张，取景框边闪一下。没有这层反馈时画面看起来是静止的，
     // 用户会以为自己根本没在拍（"不是不停的识别，而是拍一张、过几秒再拍"）。
@@ -122,10 +133,9 @@ fun QuizScreen(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
 
-    // 默认不绑 Preview，只画辅助框。实测（同一台机器、各跑 60 秒）：
-    //   绑 Preview + ImageAnalysis → 单核占用 84%，60 秒升温 7.2 ℃
-    //   只绑 ImageAnalysis       → 单核占用 35%
-    // 差的那一半是 TextureView 每帧合成 + 第二路出流。要看实时画面时加 --es preview 1。
+    // 实时预览默认不开：它要多跑一路相机出流、每帧再做一次 TextureView 合成，实测单核占用
+    // 52.9% vs 23.5%（各跑 60 秒，温度 58 ℃ vs 46 ℃）。改为「拍完把那一张显示出来」——
+    // 用户看到的正是送进识别的输入，比实时预览更准，也不发热。要实时画面时加 --es preview 1。
     val noPreview = remember {
         activity?.intent?.getStringExtra("preview") != "1"
     }
@@ -133,9 +143,22 @@ fun QuizScreen(
     // 单线程：OCR 与匹配都在这一条线上串行执行，避免并发抢 CPU（Go 设备只有小核）
     val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
 
-    // 预览与分析必须同一分辨率：取景框是 FILL_CENTER，露出多少取决于画面宽高比。
-    // 两边比例一旦不同，框里看到的和送进 OCR 的就不是同一块——实测过这个坑（框里是题 A，
+    // 取景框是 FILL_CENTER，露出多少只取决于画面宽高比，与分辨率无关。所以预览可以降分辨率，
+    // 只要和识别流同为 4:3，框里看到的和送进 OCR 的就还是同一块（踩过比例不一致的坑：框里是题 A，
     // 答案给的是画面正中的题 B）。
+    //
+    // 预览只用来判断「对准了没有」，不需要清晰到能读字：640×480 每帧要合成的像素是 1440×1080 的 1/5。
+    val previewResolutionSelector = remember {
+        ResolutionSelector.Builder()
+            .setResolutionStrategy(
+                ResolutionStrategy(
+                    Size(640, 480),
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                )
+            )
+            .build()
+    }
+
     val resolutionSelector = remember {
         ResolutionSelector.Builder()
             .setResolutionStrategy(
@@ -170,8 +193,10 @@ fun QuizScreen(
     }
     val preview = remember {
         Preview.Builder()
-            .setTargetFrameRate(Range(10, 15))
-            .setResolutionSelector(resolutionSelector)
+            // 5 fps：画面是给用户「对准」用的，不是看视频。相机帧率是全局的（AE 目标帧率区间），
+            // 这里压低会同时把分析流出帧压下来——正好，识别本来就是 3 秒一张。
+            .setTargetFrameRate(Range(5, 5))
+            .setResolutionSelector(previewResolutionSelector)
             .build()
             .apply { setSurfaceProvider(previewView.surfaceProvider) }
     }
@@ -250,6 +275,19 @@ fun QuizScreen(
         }
     }
     val shownDemo = demoState ?: state
+    // `--es demo steps`：造一条 AI 答案，用来核对长答案翻页（一屏 7 行 → 约 3 页）
+    val demoAi = remember {
+        if (activity?.intent?.getStringExtra("demo") == "steps") {
+            AiState.Done(answer = DEMO_STEPS_ANSWER, model = "demo-model", elapsedMs = 4321)
+        } else {
+            null
+        }
+    }
+    val shownAi = demoAi ?: aiState
+
+    // `--es apage N` 只给验收用：直接落在第 N 页，省得靠按键翻
+    val startPage = remember { activity?.intent?.getStringExtra("apage")?.toIntOrNull() ?: 0 }
+    LaunchedEffect(startPage) { if (startPage > 0) answerPage = startPage }
 
     // 暂停 = 真的停：连相机都不绑定。否则"暂停"只是不送 OCR，预览照样持续推流，
     // 镜腿该热还是热。代价是恢复时要重新绑定，画面会黑一两秒。
@@ -278,7 +316,13 @@ fun QuizScreen(
         when (page) {
             Page.Main -> when (event) {
                 BareKeyEvent.Click -> {
-                    if (!cameraGranted) onRequestCamera() else viewModel.togglePause()
+                    when {
+                        !cameraGranted -> onRequestCamera()
+                        // 答案长到一屏放不下时，单击改成翻页：这时候最要紧的是往后看，
+                        // 而不是暂停。只有一页时仍然是原来的暂停/继续。
+                        answerPageCount > 1 -> answerPage = (answerPage + 1) % answerPageCount
+                        else -> viewModel.togglePause()
+                    }
                 }
 
                 // 双击 = 系统返回（KEYCODE_BACK）：清结果 → 解暂停 → 退出应用
@@ -359,12 +403,15 @@ fun QuizScreen(
                 // 关键是它始终留在组合里——一旦移出，PreviewView detach，CameraX 去重配
                 // surface 会撞 5000ms 超时，界面就卡住（踩过）。
                 if (cameraGranted && !paused) {
-                    val idle = live?.hit == null
+                    // 已经出答案（题库命中或 AI 答完）就压到紧凑高度，把 56px 还给答案区；
+                // 只有「还在找题」时才用大框——那时最需要看清框住的是哪道。
+                val idle = live?.hit == null && (shownAi as? AiState.Done) == null
                     CameraViewfinder(
                         view = previewView,
                         height = if (idle) BareTokens.ViewfinderH else BareTokens.ViewfinderCompactH,
                         flash = flash,
                         showPreview = !noPreview,
+                        frame = frameShot,
                         onSize = { w, h ->
                             // 只认「还没出答案」时的高度来算裁剪比例：出答案后高度变成
                             // 100dp，按它算会把识别区裁得更窄，反而认不出，来回抖。
@@ -380,7 +427,13 @@ fun QuizScreen(
                     paused = paused,
                     onRequestCamera = onRequestCamera,
                     withViewfinder = cameraGranted && !paused,
-                    ai = aiState,
+                    ai = shownAi,
+                    answerPage = answerPage,
+                    onPageCount = { n ->
+                        answerPageCount = n
+                        // 只有越界才回第 1 页：单页答案必然重置，换成多页答案时也不会停在半截
+                        if (answerPage >= n) answerPage = 0
+                    },
                 )
             }
         }
@@ -388,6 +441,35 @@ fun QuizScreen(
 }
 
 // ---- 仅供 `--es demo` 验收排版使用 ----
+// `--es demo steps`：造一条「AI 给出的应用题详细步骤」，用来核对长答案翻页
+// （一屏 7 行、按 22 字折行，这段大约 3 页）。
+private const val DEMO_STEPS_ANSWER =
+    "1. 计算建筑面积\n" +
+        "   地下室 1200×2 = 2400 ㎡\n" +
+        "   地上 800×12 = 9600 ㎡\n" +
+        "   合计 2400+9600 = 12000 ㎡\n" +
+        "2. 计算土地取得成本\n" +
+        "   3500×12000 = 4200 万元\n" +
+        "3. 计算开发成本\n" +
+        "   建安 2800×12000 = 3360 万元\n" +
+        "   前期 3360×4% = 134.4 万元\n" +
+        "   基础设施 3360×6% = 201.6 万元\n" +
+        "   合计 3696 万元\n" +
+        "4. 计算管理费用\n" +
+        "   3696×3% = 110.88 万元\n" +
+        "5. 计算投资利息\n" +
+        "   土地 4200×[(1+6%)^2−1] = 519.12\n" +
+        "   开发 3696×[(1+6%)^1−1] = 221.76\n" +
+        "   合计 740.88 万元\n" +
+        "6. 计算销售费用\n" +
+        "   6500×3% = 195 万元\n" +
+        "7. 计算开发利润\n" +
+        "   (4200+3696)×15% = 1184.4 万元\n" +
+        "8. 计算总价与单价\n" +
+        "   总价 10127.16 万元\n" +
+        "   单价 10127.16÷12000 = 8440 元/㎡\n" +
+        "答案：8440 元/㎡"
+
 private const val DEMO_OCR_PREVIEW =
     "（ ）在中国社会主义经济发展史上第一次提出了建立房地产市场，确立了房地产市场的地位 " +
         "A．党的十一届三中全会 B．党的十二大 C．党的第十三次全国代表大会 " +
@@ -441,6 +523,7 @@ internal fun CameraViewfinder(
     fit: Boolean = false,
     flash: Boolean = false,
     showPreview: Boolean = true,
+    frame: Bitmap? = null,
     onSize: ((Int, Int) -> Unit)? = null,
 ) {
     // 换题库页要看到整个二维码，主界面只要看到"中间那几行字"，两者的取景方式不同
@@ -466,9 +549,19 @@ internal fun CameraViewfinder(
                 factory = { view },
                 modifier = Modifier.fillMaxSize(),
             )
+        } else if (frame != null) {
+            // 显示「这一张真正送去识别的那块画面」——用户要确认的就是它。
+            // 比实时预览更有用：预览只露整帧中间一小条，而这张就是识别的输入本身。
+            val bmp = frame
+            val shot = remember(bmp) { bmp.asImageBitmap() }
+            Image(
+                bitmap = shot,
+                contentDescription = "识别范围",
+                contentScale = ContentScale.FillBounds,
+                modifier = Modifier.fillMaxSize(),
+            )
         } else {
-            // 不显示画面时，用十字标出"这一条会被识别"：框本身即识别范围，
-            // 横线示意画面中心，左右两道竖线示意裁到哪。
+            // 还没拍过：先画个十字示意「这一条会被识别」，横线是画面中心，竖线是裁到哪。
             Canvas(modifier = Modifier.fillMaxSize()) {
                 val cy = size.height / 2f
                 drawLine(
@@ -501,6 +594,8 @@ private fun MainBody(
     onRequestCamera: () -> Unit,
     withViewfinder: Boolean = false,
     ai: AiState = AiState.Off,
+    answerPage: Int = 0,
+    onPageCount: (Int) -> Unit = {},
 ) {
     when (state) {
         is QuizUiState.LoadingIndex -> BareHeroText(
@@ -571,20 +666,35 @@ private fun MainBody(
                     val aiDone = ai as? AiState.Done
                     if (aiDone != null) {
                         // 题库没有这题、AI 给了答案：让识别原文让位给答案
+                        // 应用题的详细步骤远超一屏，按「屏幕能放几行」切页，单击翻页。
+                        val aiPages = remember(aiDone.answer) { paginate(aiDone.answer) }
+                        LaunchedEffect(aiDone.answer) { onPageCount(aiPages.size) }
+                        val aiIdx = answerPage.coerceIn(0, aiPages.lastIndex.coerceAtLeast(0))
                         Divider()
                         Text(
-                            text = "${aiDone.model} · ${aiDone.elapsedMs} 毫秒",
+                            text = buildString {
+                                append(aiDone.model)
+                                append(" · ")
+                                append(aiDone.elapsedMs)
+                                append(" 毫秒")
+                                if (aiPages.size > 1) {
+                                    append("  ")
+                                    append(aiIdx + 1)
+                                    append('/')
+                                    append(aiPages.size)
+                                }
+                            },
                             color = NeonGreen.copy(alpha = 0.6f),
                             fontSize = BareTokens.CaptionSp,
                             lineHeight = BareTokens.CaptionLineH,
                             maxLines = 1,
                         )
                         Text(
-                            text = aiDone.answer,
+                            text = aiPages.getOrNull(aiIdx)?.joinToString("\n") ?: aiDone.answer,
                             color = NeonGreen,
-                            fontSize = BareTokens.BodySp,
-                            lineHeight = BareTokens.BodyLineH,
-                            maxLines = if (withViewfinder) 8 else 12,
+                            fontSize = if (aiPages.size > 1) BareTokens.AnswerSmallSp else BareTokens.BodySp,
+                            lineHeight = if (aiPages.size > 1) BareTokens.AnswerSmallLineH else BareTokens.BodyLineH,
+                            maxLines = if (aiPages.size > 1) 7 else if (withViewfinder) 8 else 12,
                             overflow = TextOverflow.Ellipsis,
                         )
                     } else if (state.ocrPreview.isNotBlank()) {
@@ -625,12 +735,28 @@ private fun MainBody(
                     // 把省下来的高度全给答案。上限 7 行是按"面板 329 − 取景框 84 −
                     // 间隙/分隔线/说明行"倒推的，layout_preview.py 的 stress 用例卡的就是这条线。
                     val answerText = hit.answer.ifBlank { "（题库无答案）" }
-                    val longAnswer = answerText.length > 30 || answerText.count { it == '\n' } > 1
+                    // 长答案按「屏幕能放几行」切页，单击翻页——不然「详细步骤」只能看到开头。
+                    val pages = remember(answerText) { paginate(answerText) }
+                    LaunchedEffect(answerText) { onPageCount(pages.size) }
+                    val pageIdx = answerPage.coerceIn(0, pages.lastIndex.coerceAtLeast(0))
+                    val longAnswer = answerText.length > 30 || answerText.count { it == '\n' } > 1 ||
+                        pages.size > 1
+                    val shownAnswer = pages.getOrNull(pageIdx)?.joinToString("\n") ?: answerText
                     Text(
-                        text = when {
-                            paused -> "答案（已暂停）"
-                            state.locked -> "答案 ✓"
-                            else -> "答案（识别中）"
+                        text = buildString {
+                            append(
+                                when {
+                                    paused -> "答案（已暂停）"
+                                    state.locked -> "答案 ✓"
+                                    else -> "答案（识别中）"
+                                },
+                            )
+                            if (pages.size > 1) {
+                                append("  ")
+                                append(pageIdx + 1)
+                                append('/')
+                                append(pages.size)
+                            }
                         },
                         color = NeonGreen.copy(alpha = 0.8f),
                         fontSize = BareTokens.CaptionSp,
@@ -638,7 +764,7 @@ private fun MainBody(
                         maxLines = 1,
                     )
                     Text(
-                        text = answerText,
+                        text = shownAnswer,
                         color = NeonGreen,
                         fontSize = if (longAnswer) BareTokens.AnswerSmallSp else BareTokens.AnswerSp,
                         lineHeight = if (longAnswer) BareTokens.AnswerSmallLineH else BareTokens.AnswerLineH,
@@ -749,4 +875,49 @@ private fun Divider() {
             strokeWidth = BareTokens.STROKE_THIN,
         )
     }
+}
+
+// ---- 长答案分页 ----
+// 分页按「显示宽度」算，不按字数：16sp 下一个汉字约 16px、一个 ASCII 字符约 8px，
+// 内容面板可用宽度约 420px，也就是 26 个「汉字宽」。按字数算会把
+// "合计 2400+9600 = 12000 ㎡" 这种算式拦腰截断（一半像素还空着就折行了）。
+// 答案区高度按 layout_preview.py 的 stress 用例倒推是 7 行。
+private const val ANSWER_LINE_UNITS = 26f
+private const val ANSWER_LINES_PER_PAGE = 7
+private const val ANSWER_MAX_PAGES = 12
+
+/**
+ * 把长答案切成「一页一屏」。
+ *
+ * 先按换行拆行，再把超宽的行按显示宽度硬折，最后按 [linesPerPage] 分块。
+ * 应用题那种「一行一步」的步骤正好按行切开，不会把式子拦腰截断。
+ */
+private fun paginate(
+    text: String,
+    unitsPerLine: Float = ANSWER_LINE_UNITS,
+    linesPerPage: Int = ANSWER_LINES_PER_PAGE,
+): List<List<String>> {
+    if (text.isBlank()) return emptyList()
+    val lines = ArrayList<String>()
+    for (raw in text.split('\n')) {
+        val s = raw.trimEnd()
+        if (s.isEmpty()) {
+            lines.add("")
+            continue
+        }
+        val sb = StringBuilder()
+        var used = 0f
+        for (ch in s) {
+            val w = if (ch.code < 128) 0.5f else 1f
+            if (sb.isNotEmpty() && used + w > unitsPerLine) {
+                lines.add(sb.toString())
+                sb.setLength(0)
+                used = 0f
+            }
+            sb.append(ch)
+            used += w
+        }
+        if (sb.isNotEmpty()) lines.add(sb.toString())
+    }
+    return lines.chunked(linesPerPage).take(ANSWER_MAX_PAGES)
 }

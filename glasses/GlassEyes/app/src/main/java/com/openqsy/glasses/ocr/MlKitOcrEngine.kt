@@ -39,6 +39,8 @@ class MlKitOcrEngine : OcrEngine {
     ): OcrOutcome = withContext(Dispatchers.Default) {
         val t0 = SystemClock.elapsedRealtime()
         var keep: Bitmap? = null
+        // 交给界面的「这次认的是哪一块」。所有权转移给调用方，这里不回收。
+        var frame: Bitmap? = null
         var tPrep = t0
         try {
             val rotation = image.imageInfo.rotationDegrees
@@ -64,12 +66,12 @@ class MlKitOcrEngine : OcrEngine {
                 val turned = rotation == 90 || rotation == 270
                 // 交给 ML Kit 的是「未转正」的图 + rotation，它给出的坐标是转正之后的
                 val frameH = (if (turned) rect.width() else rect.height()).toFloat().coerceAtLeast(1f)
-                val nv21 = runCatching { cropToNv21(image, rect) }.getOrNull()
+                val cropped = runCatching { cropToNv21(image, rect) }.getOrNull()
                 // 相机缓冲到这里就用完了，立刻还回去。
                 // ML Kit 每次要几百毫秒，若等它跑完才 close，这块 buffer 就一直占着，
                 // 相机流水线跟着停——用户看到的就是「每拍一张卡一下」。
                 runCatching { image.close() }
-                if (nv21 == null) {
+                if (cropped == null) {
                     return@withContext OcrOutcome(
                         text = "",
                         elapsedMs = SystemClock.elapsedRealtime() - t0,
@@ -77,17 +79,20 @@ class MlKitOcrEngine : OcrEngine {
                     )
                 }
                 input = InputImage.fromByteBuffer(
-                    nv21,
+                    cropped.nv21,
                     rect.width(),
                     rect.height(),
                     rotation,
                     InputImage.IMAGE_FORMAT_NV21,
                 )
                 tPrep = SystemClock.elapsedRealtime()
+                // 顺手把这块画面转成位图交给界面：用户要能看到「刚才认的是哪一块」。
+                // 复用已经拷出来的 Y 平面（亮度），是一次内存里的灰度转换，不落盘。
+                frame = runCatching { yToBitmap(cropped.y, cropped.w, cropped.h, rotation) }.getOrNull()
                 val result = Tasks.await(recognizer.process(input))
                 val ms = SystemClock.elapsedRealtime() - t0
                 Log.d(TAG, "timing: prep=${tPrep - t0}ms ocr=${SystemClock.elapsedRealtime() - tPrep}ms")
-                return@withContext toOutcome(result, frameH, ms)
+                return@withContext toOutcome(result, frameH, ms).copy(frame = frame)
             }
 
             tPrep = SystemClock.elapsedRealtime()
@@ -108,6 +113,51 @@ class MlKitOcrEngine : OcrEngine {
             // 这也是这一帧唯一的出口：不存文件、不上传，只留下文字。
             runCatching { image.close() }
         }
+    }
+
+    /**
+     * 只读亮度平面抽样，做一张 2:1 的小图给界面当预览。
+     *
+     * 10 fps 也只要几个百分点 CPU——这就是「不绑 Preview 也能有流畅画面」的做法：
+     * Preview 那一路出流 + TextureView 每帧合成实测要多花一倍 CPU，而这里复用识别流已有的帧。
+     */
+    override fun thumbnail(image: ImageProxy, visibleAspect: Float): Bitmap? {
+        if (visibleAspect <= 0f) return null
+        return runCatching {
+            val rect = viewfinderRect(image, visibleAspect)
+            val yP = image.planes[0]
+            // 按行整块拷出来再抽样：逐字节 get() 每次都要做边界检查，实测那是主要开销。
+            val yb = yP.buffer.duplicate()
+            val yRow = yP.rowStride
+            val yPix = yP.pixelStride
+            val step = 4
+            val sw = (rect.width() / step).coerceAtLeast(1)
+            val sh = ((image.height - rect.top) / step).coerceAtLeast(1)
+            val row = ByteArray(rect.width() * yPix)
+            val px = IntArray(sw * sh)
+            var dst = 0
+            for (sy in 0 until sh) {
+                yb.position((rect.top + sy * step) * yRow + rect.left * yPix)
+                yb.get(row, 0, row.size)
+                var si = 0
+                repeat(sw) {
+                    val g = row[si].toInt() and 0xFF
+                    px[dst++] = (0xFF shl 24) or (g shl 16) or (g shl 8) or g
+                    si += step * yPix
+                }
+            }
+            val flat = Bitmap.createBitmap(sw, sh, Bitmap.Config.ARGB_8888)
+            flat.setPixels(px, 0, sw, 0, 0, sw, sh)
+            val rot = image.imageInfo.rotationDegrees
+            if (rot == 0) {
+                flat
+            } else {
+                val m = Matrix().apply { postRotate(rot.toFloat()) }
+                val turned = Bitmap.createBitmap(flat, 0, 0, sw, sh, m, false)
+                if (turned !== flat) flat.recycle()
+                turned
+            }
+        }.getOrNull()
     }
 
     /**
@@ -219,7 +269,7 @@ class MlKitOcrEngine : OcrEngine {
      * 自己的 rowStride / pixelStride（UV 常见是 2 像素交错），所以不能整块 memcpy，
      * 得按 stride 逐行取。0.37 MP 在 Kotlin 里约 20~40 ms。
      */
-    private fun cropToNv21(image: ImageProxy, rect: Rect): ByteBuffer {
+    private fun cropToNv21(image: ImageProxy, rect: Rect): Cropped {
         val w = rect.width()
         val h = rect.height()
         val yP = image.planes[0]
@@ -255,27 +305,61 @@ class MlKitOcrEngine : OcrEngine {
                 vi += vPix
             }
         }
-        return ByteBuffer.allocateDirect(arr.size).apply {
+        val nv21 = ByteBuffer.allocateDirect(arr.size).apply {
             put(arr)
             rewind()
-        }.also {
-            // 诊断：确认拷出来的确实是画面内容（全 0 / 全 255 说明 stride 算错了）
-            var sum = 0L
-            var n = 0
-            var mn = 255
-            var mx = 0
-            var i = 0
-            while (i < w * h) {
-                val v = arr[i].toInt() and 0xFF
-                sum += v
-                n++
-                if (v < mn) mn = v
-                if (v > mx) mx = v
-                i += 17
-            }
-            Log.d(TAG, "nv21: ${w}x$h Y avg=${sum / n.coerceAtLeast(1)} min=$mn max=$mx")
         }
+        // 诊断：确认拷出来的确实是画面内容（全 0 / 全 255 说明 stride 算错了）
+        var sum = 0L
+        var n = 0
+        var mn = 255
+        var mx = 0
+        var i = 0
+        while (i < w * h) {
+            val v = arr[i].toInt() and 0xFF
+            sum += v
+            n++
+            if (v < mn) mn = v
+            if (v > mx) mx = v
+            i += 17
+        }
+        Log.d(TAG, "nv21: ${w}x$h Y avg=${sum / n.coerceAtLeast(1)} min=$mn max=$mx")
+        return Cropped(nv21, arr, w, h)
     }
+
+    /**
+     * 把 Y 平面（亮度）转成一张位图，给界面显示「刚才认的是哪一块」。
+     *
+     * 只用 Y 不看色度：屏幕是单绿，颜色本来就没意义，而灰度图在眼镜上看起来和真实画面一致。
+     * 按 2:1 降采样——显示区只有 440×140，1080×344 的原图是纯粹浪费（每像素都要算一次
+     * 位运算 + 一次 setPixels）。**只存在内存里，不写文件。**
+     */
+    private fun yToBitmap(y: ByteArray, w: Int, h: Int, rotation: Int): Bitmap {
+        val step = 2
+        val sw = (w / step).coerceAtLeast(1)
+        val sh = (h / step).coerceAtLeast(1)
+        val px = IntArray(sw * sh)
+        var dst = 0
+        for (sy in 0 until sh) {
+            val rowOff = sy * step * w
+            for (sx in 0 until sw) {
+                val g = y[rowOff + sx * step].toInt() and 0xFF
+                px[dst++] = (0xFF shl 24) or (g shl 16) or (g shl 8) or g
+            }
+        }
+        val flat = Bitmap.createBitmap(sw, sh, Bitmap.Config.ARGB_8888)
+        flat.setPixels(px, 0, sw, 0, 0, sw, sh)
+        if (rotation == 0) return flat
+        val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
+        val turned = Bitmap.createBitmap(flat, 0, 0, sw, sh, matrix, false)
+        if (turned !== flat) flat.recycle()
+        return turned
+    }
+
+    /**
+     * 裁出来的一帧：给 ML Kit 的 NV21，以及同一块画面的 Y 平面（给界面显示用）。
+     */
+    private class Cropped(val nv21: ByteBuffer, val y: ByteArray, val w: Int, val h: Int)
 
     /**
      * 把已经转正的一帧裁成「取景框里能看到的画面」。

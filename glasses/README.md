@@ -90,7 +90,7 @@ scrcpy --window-title 题眼          # 480×640 同屏，便于确认 UI
 
 | 动作 | 硬件事件 | 行为 |
 |---|---|---|
-| 单击 | TouchPad 单指单击 `KEYCODE_ENTER` / 镜腿单击广播 | 暂停 / 继续定时拍照 |
+| 单击 | TouchPad 单指单击 `KEYCODE_ENTER` / 镜腿单击广播 | 暂停 / 继续定时拍照；答案超过一页时改为**翻页** |
 | **双击**（等同系统返回） | TouchPad 单指双击 `KEYCODE_BACK` | **返回**：关调试 → 清空结果 → 解除暂停 → **退出应用** |
 | 单指前滑 / 后滑 | `DPAD_RIGHT→DPAD_DOWN` / `DPAD_LEFT→DPAD_UP` 键序列 | 切换 top-3 候选 |
 | 长按 | TouchPad 长按 `KEYCODE_PROG_BLUE` + `ACTION_AI_START` | 调试页（索引规模 / OCR 与匹配耗时 / 频次 / 候选分数 / OCR 原文 / 当前题库 / 上传地址） |
@@ -109,6 +109,7 @@ adb shell input keyevent KEYCODE_WAKEUP                    # 不唤醒的话截�
 adb shell am start -n $PKG --es open debug                 # 调试页
 adb shell am start -n $PKG --es open scan                  # 扫码换题库页
 adb shell am start -n $PKG --es demo short|long|calc|ocr      # 灌一条假命中，验收答案区排版
+adb shell am start -n $PKG --es demo steps --es apage 2       # 灌一条 4 页的应用题解答，直接落在第 3 页
 adb shell am start -n $PKG --es url  http://…/qbank.json   # 跳过扫码，直测下载+编译
 adb shell am start -n $PKG --es qrimg /data/local/tmp/qr.png  # 跳过相机，直接解一张二维码图
 adb shell am start -n $PKG --es ocrimg /data/local/tmp/q3.png # 跳过相机，对一张图跑裁剪+识别+检索，只打日志
@@ -194,22 +195,26 @@ adb forward tcp:18080 tcp:8080
 - **定时拍照**：`ImageAnalysis` 持续取帧（`KEEP_ONLY_LATEST`），但每 **3 秒**才真正拍一张送 OCR，
   中间到的帧全部丢弃（`SHOT_INTERVAL_MS`）——屏幕上是「拍一张 → 出结果 → 定格 → 再拍」，
   而不是答案每几百毫秒抖一次；
-- **取景框 = 识别范围**：面板顶部那块框就是每次送去 OCR 的范围。默认**不绑 `Preview`**，只画
-  辅助框（中心横线 + 两侧竖线），因为实时画面太费电——同一台机器各跑 60 秒：
-  绑 `Preview` 时单核占用 **60.6%**、温度 45.6→50.4 ℃；只绑 `ImageAnalysis` 时 **25.3%**、
-  42.8→43.2 ℃。差的那一半是 TextureView 每帧合成 + 相机第二路出流。
-  要看实时画面时加 `--es preview 1`（那种模式下 FILL_CENTER 露出的是整帧纵向中间约 1/4，
-  识别前会把帧裁成同一块；`Preview` 与 `ImageAnalysis` 共用同一个 `ResolutionSelector`，
-  比例不一致会让「框里看到的」和「实际识别的」错位，踩过）。
+- **取景框 = 识别范围**：面板顶部那块框就是每次送去 OCR 的范围，框里显示的也是同一块画面
+  （同一次裁剪出来的，不会「看到这题、认出那题」）。
+  画面**不走相机 `Preview` 那一路**，而是从识别流自己抽一张 5 fps 的缩略图（`OcrEngine.thumbnail`）。
+  同一台机器各跑 60 秒实测（单核口径）：绑 `Preview` **52.9%**、只识别不显示画面 **23.5%**、
+  缩略图方案 **37.4%**，温度基本不升。多花的十几个点是每 200ms 一次「Y 平面按行抽样 + Compose 重绘」，
+  比「第二路出流 + TextureView 每帧合成」便宜一半。
+  想看硬件直出的实时画面时加 `--es preview 1`（那种模式下 `Preview` 与 `ImageAnalysis`
+  共用同一个 `ResolutionSelector`，比例不一致会让「框里看到的」和「实际识别的」错位，踩过）。
   一旦出答案**不收起框**，只从 140dp 压到 84dp（`ViewfinderCompactH`）：用户还得看得出相机
-  对着哪一段，才能确认答案是这道题的；预览模式下把整块移出组合会让 `PreviewView` detach，
+  对着哪一段，才能确认答案是这道题的；把整块移出组合会让 `PreviewView` detach，
   CameraX 去重配 surface 会撞 5000ms 超时、界面直接卡住（踩过，日志是 `Unable to configure camera` +
   `TimeoutException ... 5000 ms` + `Resetting Capture Session`）；
-  框边每拍一张闪一下，标题栏同时写着「已拍 N 张」——画面本身几乎不动，没有这两个信号用户会以为根本没在拍；
-- **中心聚焦**：裁剪后画面里常常还有两三道题。拿整段文字去检索，命中的往往是文字最密的那道，
-  不一定是用户框住的那道。所以匹配时从**最靠近画面中心的一行**出发向上下交替扩展，取 2~6 行
-  分别检索，挑分数最高的窗口（`SolveViewModel.searchAroundCenter`）——这就是「答案对到了别的题」的解法。
-  实测同一张图：取中心 2 行得 0.977，取整段只有 0.816；
+  框边每拍一张闪一下，标题栏同时写着「已拍 N 张」；
+- **顶部优先**：一屏常常有两三道题，而框住的位置本身就是最强的线索——用户把要问的那道放在框的最上面。
+  所以先把识别出来的行按「题号行」（`^\d{1,2}[.、．]`，常量 `Q_START`）切成一道一道，**从上往下试**，
+  第一道过了阈值（0.55）就是答案，最多试 3 道（`MAX_TOP_BLOCKS`）；都不行才退回
+  「以中心为锚滑动窗口」和「整段」两套兜底（`SolveViewModel.searchAroundCenter`）。
+  实测一屏三题（y=0.26 / 0.44 / 0.61）：按分数会选中中间那道（0.978），按位置才选得对顶部那道（0.576）；
+- **AI 回答期间不拍照**：把题发给 AI 之后，`aiBusy` 期间到帧直接丢；AI 回来才重新起算 3 秒。
+  否则 AI 还在思考、镜头一动又拍一张，界面会在「AI 的结论」和「下一道题」之间来回跳；
 - **改过的题不给答案**：题库再大也只有「见过的题」。同一个考点，数字被改过（26.800 → 36.800）、
   或者「属于」被改成「不属于」时，检索照样能命中原题——这时把原题答案端上去一定是错的，
   而用户看不出来。所以命中之后还有一道硬校验（`SolveViewModel.conditionConflict`）：
@@ -223,12 +228,12 @@ adb forward tcp:18080 tcp:8080
 - **AI 兜底默认关**：不填 baseUrl / API Key / 模型就完全不联网。填了之后也只有「题库没找到」或「条件不符」时才会请求（15 秒最多一次），题库命中一律本地出答案。配 AI 本身要求眼镜连着 WiFi——拉模型和提问都要访问你填的第三方接口；
 - 同一题连续命中 2 次才标记「已确认」，避免答案随噪声乱跳；
 - 答案里直接拼选项原文（`C. 中国共产党的…`，多选一行一个），不再只给字母；
-- 长答案（简答/计算/案例解答）降为 16sp、最多 7 行、题干同时压到 1 行，超出截断——一屏装不下几百字，
-  这类题的完整解答请回到原题库查看；
-- OCR 和取景预览是两个热源：OCR 已固定在 3 秒一次；预览是相机持续推流，已用
-  `Preview.Builder().setTargetFrameRate(Range(10, 15))` 把出流压到 10~15 fps
-  （同一颗 sensor 只有一档帧率，分析流会跟着降下来），功耗约减半。
-  `ImageAnalysis.Builder` **没有** `setTargetFrameRate`，写到那边会编译不过；
+- 长答案（简答/计算/案例解答、AI 给的应用题步骤）降为 16sp、每页 7 行、题干同时压到 1 行；
+  超过一页时**单击翻页**，页码跟在「答案 ✓」或「模型 · 4331 毫秒」后面（如 `2/4`）。
+  分页按**显示宽度**算（汉字 1、ASCII 0.5，每行 26 个单位），不会把 `合计 2400+9600 = 12000 ㎡`
+  这种算式拦腰截断——按字数算就会截断；
+- 两个热源：OCR 固定在 3 秒一次；预览是每秒 5 次的缩略图刷新（`THUMB_INTERVAL_MS = 200L`，
+  调大就更省电、也更卡的）。`ImageAnalysis.Builder` **没有** `setTargetFrameRate`，写到那边会编译不过；
   再长时间使用仍建议单击暂停——暂停后连相机都解绑（不只是不识别），镜腿会明显凉下来，
   代价是恢复时要重新绑定、画面黑一两秒；
 - ML Kit bundled 模型使 APK 增加约 25~35 MB；若目标固件缺少其 native 依赖，

@@ -1,5 +1,6 @@
 package com.openqsy.glasses.ocr
 
+import android.graphics.Bitmap
 import androidx.camera.core.ImageProxy
 
 /**
@@ -16,6 +17,13 @@ data class OcrOutcome(
     val elapsedMs: Long,
     val error: String? = null,
     val lines: List<OcrLine> = emptyList(),
+    /**
+     * 这一次真正送去识别的那块画面（已按取景框裁好、已转正）。
+     *
+     * 界面拿它显示「刚才认的是哪一块」——比实时预览更有用：预览只露整帧中间一小条，
+     * 而这张图就是识别输入本身。只在裁剪路径上有值。
+     */
+    val frame: Bitmap? = null,
 ) {
     val ok: Boolean get() = error == null && text.isNotBlank()
 }
@@ -41,4 +49,13 @@ interface OcrEngine {
      *   这样「屏幕上看到的」和「实际识别的」是同一块画面，不会把框外的相邻题目也认进来。
      */
     suspend fun recognize(image: ImageProxy, visibleAspect: Float = 0f): OcrOutcome
+
+    /**
+     * 生成一张小预览图，给界面显示「相机现在对着什么」。
+     *
+     * 和 [recognize] 分开是因为频率差一个数量级：识别 3 秒一次，预览要 10 fps 才不觉得卡。
+     * 实现应只读亮度平面 + 降采样，别做整帧转码。返回 null 表示这帧给不了图。
+     * 实现方**不要** close image——同一帧之后还要拿去做识别。
+     */
+    fun thumbnail(image: ImageProxy, visibleAspect: Float): Bitmap? = null
 }
